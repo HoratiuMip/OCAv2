@@ -1,6 +1,10 @@
 #include <Arduino.h>
 
 #include <esp_log.h>
+#include <nvs_flash.h>
+
+#include <a113/gep/text_utils.hpp>
+#include <a113/gep/fastcli.hpp>
 
 #include <a113/ucp/core.hpp>
 using namespace a113;
@@ -11,17 +15,32 @@ using namespace a113::freertos_literals;
 
 #include <Preferences.h>
 
+#include <Arduino_MQTT_Client.h>
+#include <Server_Side_RPC.h>
+#include <Attribute_Request.h>
+#include <Shared_Attribute_Update.h>
+#include <ThingsBoard.h>
+
+
 // ====== Fields ====== 
-const char* const         Tag          = "oca/wp-a";
+const char* const         Tag           = "oca/wp-a";
 
-i2c_master_bus_handle_t   I2C_Bus0     = NULL;
-esp32::io::I2C_m2s        I2C_AHT21    = {};
-esp32::io::I2C_m2s        I2C_BMP280   = {};
+WiFiClientSecure          WifiClient    = {};
+Arduino_MQTT_Client       MqttClient    = { WifiClient };
 
-snsd::AHT21               Sns_AHT21    = {};
-snsd::BMP280              Sns_BMP280   = {};
+i2c_master_bus_handle_t   I2C_Bus0      = NULL;
+esp32::io::I2C_m2s        I2C_AHT21     = {};
+esp32::io::I2C_m2s        I2C_BMP280    = {};
 
-Preferences               Psettings;
+snsd::AHT21               Sns_AHT21     = {};
+snsd::BMP280              Sns_BMP280    = {};
+
+Preferences               Storage             = {};
+const char* const         Storage_WIFI_SSID   = "wifi-ssid";
+const char* const         Storage_WIFI_PWRD   = "wifi-pwrd";
+const char* const         Storage_TB_SERVER   = "tb-server";
+const char* const         Storage_TB_PORT     = "tb-port";
+const char* const         Storage_TB_TOKEN    = "tb-token";
 
 // ====== Configs ======
 constexpr int SERIAL_BAUD = 115200;
@@ -54,32 +73,6 @@ constexpr i2c_device_config_t I2C_DEV_BMP280_CONFIG = {
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 
-#define LED_BUILTIN 7
-
-#include <Arduino_MQTT_Client.h>
-#include <Server_Side_RPC.h>
-#include <Attribute_Request.h>
-#include <Shared_Attribute_Update.h>
-#include <ThingsBoard.h>
-
-constexpr char WIFI_SSID[] = "";
-constexpr char WIFI_PASSWORD[] = "";
-
-// See https://thingsboard.io/docs/getting-started-guides/helloworld/
-// to understand how to obtain an access token
-constexpr char TOKEN[] =
-#include "_dev_token"
-;
-
-// Thingsboard we want to establish a connection too
-constexpr char THINGSBOARD_SERVER[] = "";
-// MQTT port used to communicate with the server, 1883 is the default unencrypted MQTT port.
-constexpr uint16_t THINGSBOARD_PORT = 20001U;
-
-// Maximum size packets will ever be sent or received by the underlying MQTT client,
-// if the size is to small messages might not be sent or received messages will be discarded
-constexpr uint32_t MAX_MESSAGE_SIZE = 1024U;
-
 // Maximum amount of attributs we can request or subscribe, has to be set both in the ThingsBoard template list and Attribute_Request_Callback template list
 // and should be the same as the amount of variables in the passed array. If it is less not all variables will be requested or subscribed
 constexpr size_t MAX_ATTRIBUTES = 3U;
@@ -91,12 +84,6 @@ constexpr uint64_t REQUEST_TIMEOUT_MICROSECONDS = 5000U * 1000U;
 constexpr const char BLINKING_INTERVAL_ATTR[] = "blinkingInterval";
 constexpr const char LED_MODE_ATTR[] = "ledMode";
 constexpr const char LED_STATE_ATTR[] = "ledState";
-
-// Initialize underlying client, used to establish a connection
-WiFiClientSecure wifiClient;
-
-// Initalize the Mqtt client instance
-Arduino_MQTT_Client mqttClient(wifiClient);
 
 // Initialize used apis
 Server_Side_RPC<3U, 5U> rpc;
@@ -110,7 +97,7 @@ const std::array<IAPI_Implementation*, 3U> apis = {
 };
 
 // Initialize ThingsBoard instance with the maximum needed buffer size, stack size and the apis we want to use
-ThingsBoard tb(mqttClient, MAX_MESSAGE_SIZE, Default_Max_Stack_Size, apis);
+ThingsBoard Tb( MqttClient, 1024, 8192, apis );
 
 // handle led state and mode changes
 volatile bool attributesChanged = false;
@@ -225,20 +212,13 @@ const Attribute_Request_Callback<MAX_ATTRIBUTES> attribute_shared_request_callba
 const Attribute_Request_Callback<MAX_ATTRIBUTES> attribute_client_request_callback(&processClientAttributes, REQUEST_TIMEOUT_MICROSECONDS, &requestTimedOut, CLIENT_ATTRIBUTES_LIST);
 
 void loop() {
-	delay(10);
-	
-	if (!reconnect()) {
-		vTaskDelay( pdMS_TO_TICKS( 500 ) );
-		return;
-	}
-	
 	if (!tb.connected()) {
 		// Connect to the ThingsBoard
 		Serial.print("Connecting to: ");
 		Serial.print(THINGSBOARD_SERVER);
 		Serial.print(" with token ");
-		Serial.println(TOKEN);
-		if (!tb.connect(THINGSBOARD_SERVER, TOKEN, THINGSBOARD_PORT)) {
+		Serial.println("123");
+		if (!tb.connect(THINGSBOARD_SERVER, "123", THINGSBOARD_PORT)) {
 			Serial.println("Failed to connect");
 			return;
 		}
@@ -328,20 +308,26 @@ protected:
 	virtual status_t _service_start( void* ctx_ ) override {
 		ESP_LOGI( Tag, "service: inet: starting..." );
 
-		Psettings.begin( "wifi_creds", true );
-		auto ssid = Psettings.getString( "ssid", "" );
-		auto pwrd = Psettings.getString( "pwrd", "" );
-		Psettings.end();
+		Storage.begin( Tag, true );
+		auto ssid = Storage.getString( Storage_WIFI_SSID, "" );
+		auto pwrd = Storage.getString( Storage_WIFI_PWRD, "" );
+		Storage.end();
 
 		A113_ASSERT_OR( not ssid.isEmpty() and not pwrd.isEmpty() ) {
 			ESP_LOGE( Tag, "service: inet: wifi credentials not set." );
-			//return A113_ERR_LOGIC;
+			return A113_ERR_LOGIC;
 		}
 
-		WiFi.begin( WIFI_SSID, WIFI_PASSWORD );
-		while( WiFi.status() != WL_CONNECTED ) {
+		WiFi.begin( ssid.c_str(), pwrd.c_str() );
+		int wifi_tries = 0;
+		do {
 			vTaskDelay( 1000_pdms2t );
-		}
+			A113_ASSERT_OR( ++wifi_tries < 5 ) {
+				ESP_LOGE( Tag, "service: inet: could not connect to wifi: %s", ssid.c_str() );
+				WiFi.disconnect();
+				return A113_ERR_PLATFORMCALL;
+			}
+		} while( WiFi.status() != WL_CONNECTED );
 		ESP_LOGI( Tag, "service: inet: connected to wifi: %s.", ssid.c_str() );
 
 		ESP_LOGI( Tag, "service: inet: started." );
@@ -349,6 +335,7 @@ protected:
 	}
 
 	virtual status_t _service_stop( void* ctx_ ) override {
+		WiFi.disconnect();
 		return A113_OK;
 	}
 
@@ -357,16 +344,26 @@ protected:
 struct _thingsboard_t {
 public:
 	status_t start( void ) {
+		ESP_LOGI( Tag, "service: thingsboard: starting..." );
 
+		Storage.begin( Tag );
+		auto server = Storage.getString( Storage_TB_SERVER, "" );
+		auto port   = Storage.getUInt( Storage_TB_PORT, 0x0 );
+		auto token  = Storage.getString( Storage_TB_TOKEN, "" );
+		Storage.end();
+
+		A113_ASSERT_OR( not server.isEmpty() and not token.isEmpty() ) {
+			ESP_LOGE( Tag, "service: thingsboard: credentials not set." );
+			return A113_ERR_LOGIC;
+		}
 	}
+
+protected:
+	ThingsBoard   _dev   = { MqttClient, 1024, 8192, _apis };
 	
 } Thingsboard;
 
-extern "C" void app_main( void ) {
-	vTaskDelay( 1000_pdms2t );
-
-	initArduino();
-
+status_t init_static( void ) {
 	i2c_new_master_bus( &I2C_BUS_0_CONFIG, &I2C_Bus0 );
 	I2C_AHT21.bind( I2C_Bus0, I2C_DEV_AHT21_CONFIG, 50 );
 	I2C_BMP280.bind( I2C_Bus0, I2C_DEV_BMP280_CONFIG, 50 );
@@ -377,6 +374,101 @@ extern "C" void app_main( void ) {
 	Sns_BMP280.bind_i2c( &I2C_BMP280 );
 	Sns_BMP280.load_calibs();
 
+	return A113_OK;
+}
+
+void query_serial( void );
+
+extern "C" void app_main( void ) {
+	vTaskPrioritySet( NULL, 5 ); 
+
+	Serial.begin( SERIAL_BAUD );
+	vTaskDelay( 1000_pdms2t );
+
+	initArduino();
+	init_static();
+
 	INet.service_start( nullptr );
+	
+	auto last_serial_act  = esp_timer_get_time();
+	int  eff_serial_delay = 100;
+	for(;;) {
+		vTaskDelay( pdMS_TO_TICKS( eff_serial_delay ) );
+		if( not Serial.available() ) {
+			if( esp_timer_get_time() - last_serial_act > 20000000 ) eff_serial_delay = 3000;
+			continue;
+		}
+		last_serial_act  = esp_timer_get_time();
+		eff_serial_delay = 100;
+		
+		query_serial();
+	}
+}
+
+
+text::Fastcli Cli{
+	{}, {
+	{
+		.text = "systemctl",
+		.opts = {
+			{ .sh0rt = 'r', .l0ng = "restart", .arg = text::Fastcli::Arg_text }
+		},
+		.fnc = [] ( auto& stencil_ ) -> status_t {
+			char opt;  while( opt = stencil_.next() ) {
+				switch( opt ) { A113_TEXT_FASTCLI_DEFAULT_STENCIL_CASES
+					case 'r': { 
+						switch( text::hash( stencil_.arg_text() ) ) {
+							case text::hash( "system" ): esp_restart(); *(volatile int*)0x0=*(int*)0x0; return A113_ERR_TERMINATED;
+							case text::hash( "storage" ): nvs_flash_erase(); break;
+						}
+					break; }
+				}
+			}
+			stencil_ += "cli: systemctl: done.";
+			return A113_OK;
+		}
+	}, {
+		.text = "set",
+		.opts = {
+			{ .sh0rt = 's', .l0ng = Storage_WIFI_SSID, .arg = text::Fastcli::Arg_text },
+			{ .sh0rt = 'p', .l0ng = Storage_WIFI_PWRD, .arg = text::Fastcli::Arg_text },
+			{ .sh0rt = 'S', .l0ng = Storage_TB_SERVER, .arg = text::Fastcli::Arg_text },
+			{ .sh0rt = 'P', .l0ng = Storage_TB_PORT,   .arg = text::Fastcli::Arg_text },
+			{ .sh0rt = 't', .l0ng = Storage_TB_TOKEN,  .arg = text::Fastcli::Arg_text }
+		},
+		.fnc = [] ( auto& stencil_ ) -> status_t {
+			#define _W_NVS( what ) \
+				Storage.begin( Tag, false ); \
+				auto that = std::move( stencil_.arg_text() ); \
+				auto bcnt = Storage.putString( what, that.c_str() ); \
+				Storage.end(); \
+				A113_ASSERT_OR( bcnt == that.length() ) { \
+					stencil_( "cli: set: {}: bad flash write.", what ); \
+				}
+
+			char opt;  while( opt = stencil_.next() ) {
+				switch( opt ) { A113_TEXT_FASTCLI_DEFAULT_STENCIL_CASES
+					case 's': { _W_NVS( Storage_WIFI_SSID ); break; } 
+					case 'p': { _W_NVS( Storage_WIFI_PWRD ); break; }
+					case 'S': { _W_NVS( Storage_TB_SERVER ); break; }
+					case 'P': { _W_NVS( Storage_TB_PORT ); break; }
+					case 't': { _W_NVS( Storage_TB_TOKEN ); break; }
+
+				}
+			}
+			stencil_ += "cli: set: done.";
+			return A113_OK;
+		}
+	} 
+} };
+
+void query_serial( void ) { 
+	auto line = Serial.readStringUntil( '\n' );
+
+	std::string out;
+	if( A113_OK != Cli.execute( line.c_str(), &out ) ) {
+		while( Serial.read() != -1 );
+	}
+	Serial.println( out.c_str() );
 }
 
