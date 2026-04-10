@@ -2,6 +2,9 @@
 
 #include <esp_log.h>
 #include <nvs_flash.h>
+#include <driver/gpio.h>
+#include <esp_adc/adc_oneshot.h>
+#include <esp_adc/adc_cali.h>
 
 #include <a113/gep/text_utils.hpp>
 #include <a113/gep/fastcli.hpp>
@@ -15,6 +18,7 @@ using namespace a113::freertos_literals;
 
 #include <Preferences.h>
 
+#include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <Arduino_MQTT_Client.h>
 #include <Server_Side_RPC.h>
@@ -53,35 +57,76 @@ public:
 		this->end();
 		return wres ? A113_OK : A113_ERR_PLATFORMCALL;
 	}
-
 };
 
+struct config_t {
+	bool   meas_led   = false;
+};
 
 // ====== Fields ====== 
-const char* const         Tag           = "oca/wp-a";
+const char* const           Tag           = "oca/wp-a";
 
-WiFiClientSecure          WifiClient    = {};
-Arduino_MQTT_Client       MqttClient    = { WifiClient };
+config_t                    Config        = {};
 
-i2c_master_bus_handle_t   I2C_Bus0      = NULL;
-esp32::io::I2C_m2s        I2C_AHT21     = {};
-esp32::io::I2C_m2s        I2C_BMP280    = {};
+WiFiClientSecure            WifiClient    = {};
+Arduino_MQTT_Client         MqttClient    = { WifiClient };
 
-snsd::AHT21               Sns_AHT21     = {};
-snsd::BMP280              Sns_BMP280    = {};
+adc_oneshot_unit_handle_t   Adc_1         = NULL;
+adc_cali_handle_t           Adc_1_Cal     = NULL;
 
-storage_t                 Storage             = {};
-const char* const         Storage_WIFI_SSID   = "wifi-ssid";
-const char* const         Storage_WIFI_PWRD   = "wifi-pwrd";
-const char* const         Storage_TB_SERVER   = "tb-server";
-const char* const         Storage_TB_PORT     = "tb-port";
-const char* const         Storage_TB_TOKEN    = "tb-token";
+i2c_master_bus_handle_t     I2C_Bus0      = NULL;
+esp32::io::I2C_m2s          I2C_AHT21     = {};
+esp32::io::I2C_m2s          I2C_BMP280    = {};
+
+snsd::AHT21                 Sns_AHT21     = {};
+snsd::BMP280                Sns_BMP280    = {};
+
+storage_t                   Storage       = {};
 
 // ====== Configs ======
-constexpr int   SERIAL_BAUD        = 115200;
-constexpr int   SERIAL_FAST_MS     = 100;
-constexpr int   SERIAL_IDLE_MS     = 3000;
-constexpr int   SERIAL_ACT_TO_US   = 20000000;
+constexpr int                 SERIAL_BAUD         = 115200;
+constexpr int                 SERIAL_FAST_MS      = 100;
+constexpr int                 SERIAL_IDLE_MS      = 3000;
+constexpr int                 SERIAL_ACT_TO_US    = 20000000;
+
+constexpr int                 MEAS_INTERVAL_MS    = 30000;
+
+constexpr const char* const   STORAGE_WIFI_SSID   = "wifi-ssid";
+constexpr const char* const   STORAGE_WIFI_PWRD   = "wifi-pwrd";
+constexpr const char* const   STORAGE_TB_SERVER   = "tb-server";
+constexpr const char* const   STORAGE_TB_PORT     = "tb-port";
+constexpr const char* const   STORAGE_TB_TOKEN    = "tb-token";
+
+constexpr int                 UPPER_LIM_ATTR      = 3;
+constexpr int                 ATTR_REQ_TO_US      = 10000000;
+constexpr gpio_num_t          GPIO_MEAS_LED_NUM   = GPIO_NUM_7;
+constexpr const char* const   ATTR_SH_MEAS_LED    = "meas-led";
+
+constexpr adc_oneshot_unit_init_cfg_t ADC_UNIT_1_CONFIG = {
+	.unit_id  = ADC_UNIT_1,
+	.clk_src  = ADC_DIGI_CLK_SRC_DEFAULT,
+	.ulp_mode = ADC_ULP_MODE_DISABLE
+};
+
+constexpr adc_oneshot_chan_cfg_t ADC_SOIL_MOISTURE_CHANNEL_CONFIG = {
+	.atten    = ADC_ATTEN_DB_12,
+	.bitwidth = ADC_BITWIDTH_12
+};
+
+constexpr adc_cali_curve_fitting_config_t ADC_SOIL_MOISTURE_CAL_CONFIG = {
+	.unit_id  = ADC_UNIT_1,
+	.chan     = ADC_CHANNEL_2,
+	.atten    = ADC_ATTEN_DB_12,
+	.bitwidth = ADC_BITWIDTH_12
+};
+
+constexpr gpio_config_t GPIO_MEAS_LED_CONFIG = {
+	.pin_bit_mask = 0x1ULL << GPIO_MEAS_LED_NUM,
+	.mode         = GPIO_MODE_OUTPUT,
+	.pull_up_en   = GPIO_PULLUP_DISABLE,
+	.pull_down_en = GPIO_PULLDOWN_DISABLE,
+	.intr_type    = GPIO_INTR_DISABLE
+};
 
 constexpr i2c_master_bus_config_t I2C_BUS_0_CONFIG = {
 	.i2c_port          = I2C_NUM_0,
@@ -108,118 +153,15 @@ constexpr i2c_device_config_t I2C_DEV_BMP280_CONFIG = {
 	.scl_speed_hz    = 100000,
 };
 
-#include <WiFi.h>
-#include <WiFiClientSecure.h>
-
-// Maximum amount of attributs we can request or subscribe, has to be set both in the ThingsBoard template list and Attribute_Request_Callback template list
-// and should be the same as the amount of variables in the passed array. If it is less not all variables will be requested or subscribed
-constexpr size_t MAX_ATTRIBUTES = 3U;
-
-constexpr uint64_t REQUEST_TIMEOUT_MICROSECONDS = 5000U * 1000U;
-
-// Attribute names for attribute request and attribute updates functionality
-
-constexpr const char BLINKING_INTERVAL_ATTR[] = "blinkingInterval";
-constexpr const char LED_MODE_ATTR[] = "ledMode";
-constexpr const char LED_STATE_ATTR[] = "ledState";
-
-
-// handle led state and mode changes
-volatile bool attributesChanged = false;
-
-// LED modes: 0 - continious state, 1 - blinking
-volatile int ledMode = 0;
-
-// Current led state
-volatile bool ledState = false;
-
-// Settings for interval in blinking mode
-constexpr uint16_t BLINKING_INTERVAL_MS_MIN = 10U;
-constexpr uint16_t BLINKING_INTERVAL_MS_MAX = 60000U;
-volatile uint16_t blinkingInterval = 1000U;
-
-uint32_t previousStateChange;
-
-// For telemetry
-constexpr int16_t telemetrySendInterval = 2000U;
-uint32_t previousDataSend;
-
-
-/// @brief Processes function for RPC call "setLedMode"
-/// RPC_Data is a JSON variant, that can be queried using operator[]
-/// See https://arduinojson.org/v5/api/jsonvariant/subscript/ for more details
-/// @param data Data containing the rpc data that was called and its current value
-void processSetLedMode(const JsonVariantConst &data, JsonDocument &response) {
-	Serial.println("Received the set led state RPC method");
-	
-	// Process data
-	int new_mode = data;
-	
-	Serial.print("Mode to change: ");
-	Serial.println(new_mode);
-	StaticJsonDocument<1> response_doc;
-	
-	if (new_mode != 0 && new_mode != 1) {
-		response_doc["error"] = "Unknown mode!";
-		response.set(response_doc);
-		return;
-	}
-	
-	ledMode = new_mode;
-	
-	attributesChanged = true;
-	
-	// Returning current mode
-	response_doc["newMode"] = (int)ledMode;
-	response.set(response_doc);
-}
-
-/// @brief Update callback that will be called as soon as one of the provided shared attributes changes value,
-/// if none are provided we subscribe to any shared attribute change instead
-/// @param data Data containing the shared attributes that were changed and their current value
-void processSharedAttributes(const JsonObjectConst &data) {
-	for (auto it = data.begin(); it != data.end(); ++it) {
-		if (strcmp(it->key().c_str(), BLINKING_INTERVAL_ATTR) == 0) {
-			const uint16_t new_interval = it->value().as<uint16_t>();
-			if (new_interval >= BLINKING_INTERVAL_MS_MIN && new_interval <= BLINKING_INTERVAL_MS_MAX) {
-				blinkingInterval = new_interval;
-				Serial.print("Blinking interval is set to: ");
-				Serial.println(new_interval);
-			}
-		} else if (strcmp(it->key().c_str(), LED_STATE_ATTR) == 0) {
-			ledState = it->value().as<bool>();
-			if (LED_BUILTIN != 99) {
-				digitalWrite(LED_BUILTIN, ledState);
-			}
-			Serial.print("LED state is set to: ");
-			Serial.println(ledState);
-		}
-	}
-	attributesChanged = true;
-}
-
-void processClientAttributes(const JsonObjectConst &data) {
-	for (auto it = data.begin(); it != data.end(); ++it) {
-		if (strcmp(it->key().c_str(), LED_MODE_ATTR) == 0) {
-			const uint16_t new_mode = it->value().as<uint16_t>();
-			ledMode = new_mode;
-		}
-	}
-}
-
-// Attribute request did not receive a response in the expected amount of microseconds 
-void requestTimedOut() {
-	Serial.printf("Attribute request timed out did not receive a response in (%llu) microseconds. Ensure client is connected to the MQTT broker and that the keys actually exist on the target device\n", REQUEST_TIMEOUT_MICROSECONDS);
-}
-
+// ====== Compounds ======
 struct _inet_t : public Compound {
 protected:
 	virtual status_t _compound_start( [[maybe_unused]]void* ) override {
 		ESP_LOGI( Tag, "compound: inet: starting..." );
 
 		Storage.begin( Tag, true );
-		auto ssid = Storage.getString( Storage_WIFI_SSID, "" );
-		auto pwrd = Storage.getString( Storage_WIFI_PWRD, "" );
+		auto ssid = Storage.getString( STORAGE_WIFI_SSID, "" );
+		auto pwrd = Storage.getString( STORAGE_WIFI_PWRD, "" );
 		Storage.end();
 
 		A113_ASSERT_OR( not ssid.isEmpty() and not pwrd.isEmpty() ) {
@@ -250,43 +192,35 @@ protected:
 
 } INet;
 
-namespace _tb_cfg {
-	Server_Side_RPC< 3, 5 >                        rpc;
-	Attribute_Request< 2, MAX_ATTRIBUTES >         attr_request;
-	Shared_Attribute_Update< 3, MAX_ATTRIBUTES >   shared_update;
-
-	const std::array<IAPI_Implementation*, 3 >   apis   = {
-		&rpc,
-		&attr_request,
-		&shared_update
-	};
-
-	inline static constexpr std::array< const char*, 2 > SHARED_ATTRIBUTES_LIST = {
-		LED_STATE_ATTR,
-		BLINKING_INTERVAL_ATTR
-	};
-
-	inline static constexpr std::array< const char*, 1 > CLIENT_ATTRIBUTES_LIST = {
-		LED_MODE_ATTR
-	};
-
-	const std::array< RPC_Callback, 1 > callbacks = {
-		RPC_Callback{ "setLedMode", processSetLedMode }
-	};
-
-	const Shared_Attribute_Callback< MAX_ATTRIBUTES > attributes_callback(&processSharedAttributes, SHARED_ATTRIBUTES_LIST.cbegin(), SHARED_ATTRIBUTES_LIST.cend());
-	const Attribute_Request_Callback< MAX_ATTRIBUTES > attribute_shared_request_callback(&processSharedAttributes, REQUEST_TIMEOUT_MICROSECONDS, &requestTimedOut, SHARED_ATTRIBUTES_LIST);
-	const Attribute_Request_Callback< MAX_ATTRIBUTES > attribute_client_request_callback(&processClientAttributes, REQUEST_TIMEOUT_MICROSECONDS, &requestTimedOut, CLIENT_ATTRIBUTES_LIST);
-};
 struct _thingsboard_t : public Compound {
+protected:
+	static void _rpc_meas_now( const JsonVariantConst& arg_, JsonDocument& resp_ );
+	
+	static void _attr_sh_update( const JsonObjectConst& arg_ );
+
+protected:
+	inline static Server_Side_RPC< 3, 5 >                        _rpc             = {};
+	inline static Attribute_Request< 3, UPPER_LIM_ATTR >         _attr_request    = {};
+	inline static Shared_Attribute_Update< 3, UPPER_LIM_ATTR >   _shared_update   = {};
+
+	inline static const std::array< IAPI_Implementation*, 3 >    _APIs   = {
+		&_rpc, &_attr_request, &_shared_update
+	};
+	inline static const std::array< RPC_Callback, 1 >            _RPC_Callbacks   = {
+		RPC_Callback{ "meas-now", _rpc_meas_now }
+	};
+	inline static const std::array< const char*, 1 >             _Attr_Shared     = {
+		ATTR_SH_MEAS_LED
+	};
+
 protected:
 	status_t _compound_start( [[maybe_unused]]void* ) {
 		ESP_LOGI( Tag, "compound: thingsboard: starting..." );
 
 		Storage.begin( Tag, true );
-		auto server = Storage.getString( Storage_TB_SERVER, "" );
-		auto port   = Storage.getInt( Storage_TB_PORT, 0x0 );
-		auto token  = Storage.getString( Storage_TB_TOKEN, "" );
+		auto server = Storage.getString( STORAGE_TB_SERVER, "" );
+		auto port   = Storage.getInt( STORAGE_TB_PORT, 0x0 );
+		auto token  = Storage.getString( STORAGE_TB_TOKEN, "" );
 		Storage.end();
 		
 		int cred_bits = ( ( not server.isEmpty() ) << 2 ) |
@@ -302,13 +236,22 @@ protected:
 			return A113_ERR_EXCOMCALL;
 		}
 
-		A113_ASSERT_OR( _tb_cfg::rpc.RPC_Subscribe( _tb_cfg::callbacks.cbegin(), _tb_cfg::callbacks.cend() ) ) {
+		A113_ASSERT_OR( _rpc.RPC_Subscribe( _RPC_Callbacks.cbegin(), _RPC_Callbacks.cend() ) ) {
 			ESP_LOGE( Tag, "compound: thingsboard: bad rpc subscribe." );
 			return A113_ERR_EXCOMCALL;
 		}
 		
-		A113_ASSERT_OR( _tb_cfg::shared_update.Shared_Attributes_Subscribe( _tb_cfg::attributes_callback ) ) {
+		A113_ASSERT_OR( _shared_update.Shared_Attributes_Subscribe(
+			Shared_Attribute_Callback< UPPER_LIM_ATTR >{ &_attr_sh_update, _Attr_Shared.cbegin(), _Attr_Shared.cend() }
+		) ) {
 			ESP_LOGE( Tag, "compound: thingsboard: bad shared subscribe." );
+			return A113_ERR_EXCOMCALL;
+		}
+
+		A113_ASSERT_OR( _attr_request.Shared_Attributes_Request(  
+			Attribute_Request_Callback< UPPER_LIM_ATTR >{ &_attr_sh_update, ATTR_REQ_TO_US, [](){}, _Attr_Shared }
+		) ) {
+			ESP_LOGE( Tag, "compound: thingsboard: bad shared request." );
 			return A113_ERR_EXCOMCALL;
 		}
 
@@ -325,33 +268,103 @@ protected:
 	}
 
 	status_t _compound_stop( [[maybe_unused]]void* ) {
+		_dev.disconnect();
 		return A113_OK;
 	}
 
 protected:
-	ThingsBoard    _dev        = { MqttClient, 1024, 8192, _tb_cfg::apis };
-	TaskHandle_t   _tsk_main   = NULL;
+	ThingsBoard    _dev         = { MqttClient, 1024, 8192, _APIs };
+	TaskHandle_t   _tsk_main    = NULL;
+	int64_t        _prev_env    = 0x0;
 
 protected:
 	static void _main( void* self_ ) {
-		auto* self = ( _thingsboard_t* )self_;
-	for( ;; ) {
-		float temp = 0.0;
-		
-		Sns_BMP280.store_ctrl_meas( snsd::BMP280::CtrlMeas_TemperatureSampling_1x | snsd::BMP280::CtrlMeas_PressureSampling_1x | snsd::BMP280::CtrlMeas_Power_OneShot );
-		vTaskDelay( pdMS_TO_TICKS( 10 ) );
-		Sns_BMP280.load_data( &temp, nullptr );
-		Sns_BMP280.store_ctrl_meas( snsd::BMP280::CtrlMeas_Power_Low );
-		self->_dev.sendTelemetryData("temperature", temp);
-		self->_dev.loop();
+		auto*   self   = ( _thingsboard_t* )self_;
+	
+	for(; self->compound_is_up();) {
+		int64_t t_now = esp_timer_get_time() / 1000;
 
-		vTaskDelay( 3000_pdms2t );
+		if( t_now - self->_prev_env > MEAS_INTERVAL_MS ) {
+			self->_prev_env = t_now;
+
+			if( Config.meas_led ) {
+				gpio_set_level( GPIO_MEAS_LED_NUM, HIGH );
+			}
+
+			struct {
+				float   temp_a   = 0.0;
+				float   temp_b   = 0.0;
+				float   press    = 0.0;
+				float   hum_air  = 0.0;
+				float   hum_sol  = 0.0;
+			} env;
+
+			int voltage = 0; 
+			adc_oneshot_read( Adc_1, ADC_CHANNEL_2, &voltage );
+			adc_cali_raw_to_voltage( Adc_1_Cal, voltage, &voltage );
+			env.hum_sol = ( float )voltage / 1e3;
+
+			self->_dev.sendTelemetryData( "humidity_soil", env.hum_sol );
+			
+			Sns_BMP280.store_ctrl_meas( snsd::BMP280::CtrlMeas_TemperatureSampling_1x | snsd::BMP280::CtrlMeas_PressureSampling_1x | snsd::BMP280::CtrlMeas_Power_OneShot );
+			vTaskDelay( 20_pdms2t );
+			Sns_BMP280.load_data( &env.temp_a, &env.press );
+			Sns_BMP280.store_ctrl_meas( snsd::BMP280::CtrlMeas_Power_Low );
+
+			self->_dev.sendTelemetryData( "temperature_a", env.temp_a );
+			self->_dev.sendTelemetryData( "pressure", env.press );
+
+			Sns_AHT21.one_shot();
+			vTaskDelay( 70_pdms2t );
+			Sns_AHT21.load_data( &env.temp_b, &env.hum_air );
+
+			self->_dev.sendTelemetryData( "temperature_b", env.temp_b );
+			self->_dev.sendTelemetryData( "humidity_air", env.hum_air );
+
+			gpio_set_level( GPIO_MEAS_LED_NUM, LOW );
+
+			self->_dev.sendAttributeData( "wifi_rssi", WiFi.RSSI() ); 
+		}
+
+		self->_dev.loop();
+		vTaskDelay( 100_pdms2t );
 	}
 	}
+
+public:
+	void force_env( void ) { _prev_env = 0x0; }
 	
 } Thingsboard;
 
+void _thingsboard_t::_rpc_meas_now( const JsonVariantConst& arg_, JsonDocument& resp_ ) {
+	ESP_LOGI( Tag, "compound: thingsboard: executing rpc: meas-now..." );
+	Thingsboard.force_env();
+	ESP_LOGI( Tag, "compound: thingsboard: executed rpc: meas-now..." );
+}
+
+void _thingsboard_t::_attr_sh_update( const JsonObjectConst& arg_ ) {
+	ESP_LOGI( Tag, "compound: thingsboard: refreshing shared attribs..." );
+
+	for( auto itr : arg_ ) {
+		switch( text::hash( itr.key().c_str() ) ) {
+			case text::hash( ATTR_SH_MEAS_LED ): {
+				Config.meas_led = itr.value().as< uint16_t >();
+			break; }
+		}
+	}
+
+	ESP_LOGI( Tag, "compound: thingsboard: refreshed shared attribs." );
+}
+
+
+// ====== Main ======
 status_t init_static( void ) {
+	adc_oneshot_new_unit( &ADC_UNIT_1_CONFIG, &Adc_1 );
+	adc_oneshot_config_channel( Adc_1, ADC_CHANNEL_2, &ADC_SOIL_MOISTURE_CHANNEL_CONFIG );
+	adc_cali_create_scheme_curve_fitting( &ADC_SOIL_MOISTURE_CAL_CONFIG, &Adc_1_Cal );
+
+	gpio_config( &GPIO_MEAS_LED_CONFIG );
+
 	i2c_new_master_bus( &I2C_BUS_0_CONFIG, &I2C_Bus0 );
 	I2C_AHT21.bind( I2C_Bus0, I2C_DEV_AHT21_CONFIG, 50 );
 	I2C_BMP280.bind( I2C_Bus0, I2C_DEV_BMP280_CONFIG, 50 );
@@ -394,6 +407,7 @@ extern "C" void app_main( void ) {
 	}
 }
 
+// ====== Cli ======
 text::Fastcli Cli{
 	{}, {
 	{
@@ -418,41 +432,41 @@ text::Fastcli Cli{
 	}, {
 		.text = "set",
 		.opts = {
-			{ .sh0rt = 's', .l0ng = Storage_WIFI_SSID, .arg = text::Fastcli::Arg_text },
-			{ .sh0rt = 'p', .l0ng = Storage_WIFI_PWRD, .arg = text::Fastcli::Arg_text },
-			{ .sh0rt = 'S', .l0ng = Storage_TB_SERVER, .arg = text::Fastcli::Arg_text },
-			{ .sh0rt = 'P', .l0ng = Storage_TB_PORT,   .arg = text::Fastcli::Arg_i32 },
-			{ .sh0rt = 't', .l0ng = Storage_TB_TOKEN,  .arg = text::Fastcli::Arg_text }
+			{ .sh0rt = 's', .l0ng = STORAGE_WIFI_SSID, .arg = text::Fastcli::Arg_text },
+			{ .sh0rt = 'p', .l0ng = STORAGE_WIFI_PWRD, .arg = text::Fastcli::Arg_text },
+			{ .sh0rt = 'S', .l0ng = STORAGE_TB_SERVER, .arg = text::Fastcli::Arg_text },
+			{ .sh0rt = 'P', .l0ng = STORAGE_TB_PORT,   .arg = text::Fastcli::Arg_i32 },
+			{ .sh0rt = 't', .l0ng = STORAGE_TB_TOKEN,  .arg = text::Fastcli::Arg_text }
 		},
 		.fnc = [] ( auto& stencil_ ) -> status_t {
 			char opt;  while( opt = stencil_.next() ) {
 				switch( opt ) { A113_TEXT_FASTCLI_DEFAULT_STENCIL_CASES
 					case 's': {
-						A113_ASSERT_OR( A113_OK == Storage.write< std::string >( Tag, Storage_WIFI_SSID, stencil_.arg_text() ) )
+						A113_ASSERT_OR( A113_OK == Storage.write< std::string >( Tag, STORAGE_WIFI_SSID, stencil_.arg_text() ) )
 							stencil_ += "cli: set wifi ssid: bad storage.\n";
 						else
 							stencil_ += "cli: set wifi ssid: ok.\n";
 					break; }
 					case 'p': {
-						A113_ASSERT_OR( A113_OK == Storage.write< std::string >( Tag, Storage_WIFI_PWRD, stencil_.arg_text() ) )
+						A113_ASSERT_OR( A113_OK == Storage.write< std::string >( Tag, STORAGE_WIFI_PWRD, stencil_.arg_text() ) )
 							stencil_ += "cli: set wifi password: bad storage.\n";
 						else
 							stencil_ += "cli: set wifi ssid: ok.\n";
 					break; }
 					case 'S': {
-						A113_ASSERT_OR( A113_OK == Storage.write< std::string >( Tag, Storage_TB_SERVER, stencil_.arg_text() ) )
+						A113_ASSERT_OR( A113_OK == Storage.write< std::string >( Tag, STORAGE_TB_SERVER, stencil_.arg_text() ) )
 							stencil_ += "cli: set tb server: bad storage.\n";
 						else
 							stencil_ += "cli: set tb server: ok.\n";
 					break; }
 					case 'P': {
-						A113_ASSERT_OR( A113_OK == Storage.write< int >( Tag, Storage_TB_PORT, stencil_.arg_i32() ) )
+						A113_ASSERT_OR( A113_OK == Storage.write< int >( Tag, STORAGE_TB_PORT, stencil_.arg_i32() ) )
 							stencil_ += "cli: set tb port: bad storage.\n";
 						else
 							stencil_ += "cli: set tb port: ok.\n";
 					break; }
 					case 't': { 
-						A113_ASSERT_OR( A113_OK == Storage.write< std::string >( Tag, Storage_TB_TOKEN, stencil_.arg_text() ) )
+						A113_ASSERT_OR( A113_OK == Storage.write< std::string >( Tag, STORAGE_TB_TOKEN, stencil_.arg_text() ) )
 							stencil_ += "cli: set tb token: bad storage.\n";
 						else
 							stencil_ += "cli: set tb token: ok.\n";
