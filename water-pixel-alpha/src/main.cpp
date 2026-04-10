@@ -15,11 +15,46 @@ using namespace a113::freertos_literals;
 
 #include <Preferences.h>
 
+#include <WiFiClientSecure.h>
 #include <Arduino_MQTT_Client.h>
 #include <Server_Side_RPC.h>
 #include <Attribute_Request.h>
 #include <Shared_Attribute_Update.h>
 #include <ThingsBoard.h>
+
+// ====== Structs ======
+struct storage_t : public Preferences {
+protected:
+	std::mutex   _mtx;
+
+public:
+	A113_inline bool begin( const char* sector_, bool ro_ ) { 
+		_mtx.lock();
+		return this->Preferences::begin( sector_, ro_ ); 
+	}
+
+	A113_inline void end( void ) {
+		this->Preferences::end();
+		_mtx.unlock();
+	}
+
+public:
+	template< typename _T_ >
+	status_t write( const char* sector_, const char* key_, const _T_& val_ ) {
+		this->begin( sector_, false );
+
+		bool wres = false;
+		if constexpr( std::is_same_v< std::string, _T_ > ) {
+			wres = val_.length() == this->putString( key_, val_.c_str() );
+		} else if constexpr( std::is_same_v< int, _T_ > ) {
+			wres = sizeof( int ) == this->putInt( key_, val_ );
+		}
+
+		this->end();
+		return wres ? A113_OK : A113_ERR_PLATFORMCALL;
+	}
+
+};
 
 
 // ====== Fields ====== 
@@ -35,7 +70,7 @@ esp32::io::I2C_m2s        I2C_BMP280    = {};
 snsd::AHT21               Sns_AHT21     = {};
 snsd::BMP280              Sns_BMP280    = {};
 
-Preferences               Storage             = {};
+storage_t                 Storage             = {};
 const char* const         Storage_WIFI_SSID   = "wifi-ssid";
 const char* const         Storage_WIFI_PWRD   = "wifi-pwrd";
 const char* const         Storage_TB_SERVER   = "tb-server";
@@ -43,7 +78,10 @@ const char* const         Storage_TB_PORT     = "tb-port";
 const char* const         Storage_TB_TOKEN    = "tb-token";
 
 // ====== Configs ======
-constexpr int SERIAL_BAUD = 115200;
+constexpr int   SERIAL_BAUD        = 115200;
+constexpr int   SERIAL_FAST_MS     = 100;
+constexpr int   SERIAL_IDLE_MS     = 3000;
+constexpr int   SERIAL_ACT_TO_US   = 20000000;
 
 constexpr i2c_master_bus_config_t I2C_BUS_0_CONFIG = {
 	.i2c_port          = I2C_NUM_0,
@@ -85,19 +123,6 @@ constexpr const char BLINKING_INTERVAL_ATTR[] = "blinkingInterval";
 constexpr const char LED_MODE_ATTR[] = "ledMode";
 constexpr const char LED_STATE_ATTR[] = "ledState";
 
-// Initialize used apis
-Server_Side_RPC<3U, 5U> rpc;
-Attribute_Request<2U, MAX_ATTRIBUTES> attr_request;
-Shared_Attribute_Update<3U, MAX_ATTRIBUTES> shared_update;
-
-const std::array<IAPI_Implementation*, 3U> apis = {
-	&rpc,
-	&attr_request,
-	&shared_update
-};
-
-// Initialize ThingsBoard instance with the maximum needed buffer size, stack size and the apis we want to use
-ThingsBoard Tb( MqttClient, 1024, 8192, apis );
 
 // handle led state and mode changes
 volatile bool attributesChanged = false;
@@ -118,17 +143,6 @@ uint32_t previousStateChange;
 // For telemetry
 constexpr int16_t telemetrySendInterval = 2000U;
 uint32_t previousDataSend;
-
-// List of shared attributes for subscribing to their updates
-constexpr std::array<const char *, 2U> SHARED_ATTRIBUTES_LIST = {
-	LED_STATE_ATTR,
-	BLINKING_INTERVAL_ATTR
-};
-
-// List of client attributes for requesting them (Using to initialize device states)
-constexpr std::array<const char *, 1U> CLIENT_ATTRIBUTES_LIST = {
-	LED_MODE_ATTR
-};
 
 
 /// @brief Processes function for RPC call "setLedMode"
@@ -159,15 +173,6 @@ void processSetLedMode(const JsonVariantConst &data, JsonDocument &response) {
 	response_doc["newMode"] = (int)ledMode;
 	response.set(response_doc);
 }
-
-
-// Optional, keep subscribed shared attributes empty instead,
-// and the callback will be called for every shared attribute changed on the device,
-// instead of only the one that were entered instead
-const std::array<RPC_Callback, 1U> callbacks = {
-	RPC_Callback{ "setLedMode", processSetLedMode }
-};
-
 
 /// @brief Update callback that will be called as soon as one of the provided shared attributes changes value,
 /// if none are provided we subscribe to any shared attribute change instead
@@ -207,106 +212,10 @@ void requestTimedOut() {
 	Serial.printf("Attribute request timed out did not receive a response in (%llu) microseconds. Ensure client is connected to the MQTT broker and that the keys actually exist on the target device\n", REQUEST_TIMEOUT_MICROSECONDS);
 }
 
-const Shared_Attribute_Callback<MAX_ATTRIBUTES> attributes_callback(&processSharedAttributes, SHARED_ATTRIBUTES_LIST.cbegin(), SHARED_ATTRIBUTES_LIST.cend());
-const Attribute_Request_Callback<MAX_ATTRIBUTES> attribute_shared_request_callback(&processSharedAttributes, REQUEST_TIMEOUT_MICROSECONDS, &requestTimedOut, SHARED_ATTRIBUTES_LIST);
-const Attribute_Request_Callback<MAX_ATTRIBUTES> attribute_client_request_callback(&processClientAttributes, REQUEST_TIMEOUT_MICROSECONDS, &requestTimedOut, CLIENT_ATTRIBUTES_LIST);
-
-void loop() {
-	if (!tb.connected()) {
-		// Connect to the ThingsBoard
-		Serial.print("Connecting to: ");
-		Serial.print(THINGSBOARD_SERVER);
-		Serial.print(" with token ");
-		Serial.println("123");
-		if (!tb.connect(THINGSBOARD_SERVER, "123", THINGSBOARD_PORT)) {
-			Serial.println("Failed to connect");
-			return;
-		}
-		Serial.println( "OK" );
-		
-		// Sending a MAC address as an attribute
-		tb.sendAttributeData("macAddress", WiFi.macAddress().c_str());
-		
-		Serial.println("Subscribing for RPC...");
-		// Perform a subscription. All consequent data processing will happen in
-		// processSetLedState() and processSetLedMode() functions,
-		// as denoted by callbacks array.
-		if (!rpc.RPC_Subscribe(callbacks.cbegin(), callbacks.cend())) {
-			Serial.println("Failed to subscribe for RPC");
-			return;
-		}
-		
-		if (!shared_update.Shared_Attributes_Subscribe(attributes_callback)) {
-			Serial.println("Failed to subscribe for shared attribute updates");
-			return;
-		}
-		
-		Serial.println("Subscribe done");
-		
-		// Request current states of shared attributes
-		if (!attr_request.Shared_Attributes_Request(attribute_shared_request_callback)) {
-			Serial.println("Failed to request for shared attributes");
-			return;
-		}
-		
-		// Request current states of client attributes
-		if (!attr_request.Client_Attributes_Request(attribute_client_request_callback)) {
-			Serial.println("Failed to request for client attributes");
-			return;
-		}
-	}
-	
-	if (attributesChanged) {
-		attributesChanged = false;
-		if (ledMode == 0) {
-			previousStateChange = millis();
-		}
-		tb.sendTelemetryData(LED_MODE_ATTR, ledMode);
-		tb.sendTelemetryData(LED_STATE_ATTR, ledState);
-		tb.sendAttributeData(LED_MODE_ATTR, ledMode);
-		tb.sendAttributeData(LED_STATE_ATTR, ledState);
-	}
-	
-	if (ledMode == 1 && millis() - previousStateChange > blinkingInterval) {
-		previousStateChange = millis();
-		ledState = 1;
-		tb.sendTelemetryData(LED_STATE_ATTR, ledState);
-		tb.sendAttributeData(LED_STATE_ATTR, ledState);
-		if (LED_BUILTIN == 99) {
-			Serial.print("LED state changed to: ");
-			Serial.println(ledState);
-		} else {
-			digitalWrite(LED_BUILTIN, ledState);
-		}
-	}
-	
-	// Sending telemetry every telemetrySendInterval time
-	if (millis() - previousDataSend > telemetrySendInterval) {
-		previousDataSend = millis();
-		
-		float temp = 0.0; 
-		
-		
-		Sns_BMP280.store_ctrl_meas( snsd::BMP280::CtrlMeas_TemperatureSampling_1x | snsd::BMP280::CtrlMeas_PressureSampling_1x | snsd::BMP280::CtrlMeas_Power_OneShot )
-		;
-		vTaskDelay( pdMS_TO_TICKS( 10 ) );
-		Sns_BMP280.load_data( &temp, nullptr );
-		Sns_BMP280.store_ctrl_meas( snsd::BMP280::CtrlMeas_Power_Low );
-		tb.sendTelemetryData("temperature", temp);
-		tb.sendAttributeData("rssi", WiFi.RSSI());
-		tb.sendAttributeData("channel", WiFi.channel());
-		tb.sendAttributeData("bssid", WiFi.BSSIDstr().c_str());
-		tb.sendAttributeData("localIp", WiFi.localIP().toString().c_str());
-		tb.sendAttributeData("ssid", WiFi.SSID().c_str());
-	}
-	
-	tb.loop();
-}
-
-struct _inet_t : public Service {
+struct _inet_t : public Compound {
 protected:
-	virtual status_t _service_start( void* ctx_ ) override {
-		ESP_LOGI( Tag, "service: inet: starting..." );
+	virtual status_t _compound_start( [[maybe_unused]]void* ) override {
+		ESP_LOGI( Tag, "compound: inet: starting..." );
 
 		Storage.begin( Tag, true );
 		auto ssid = Storage.getString( Storage_WIFI_SSID, "" );
@@ -314,8 +223,8 @@ protected:
 		Storage.end();
 
 		A113_ASSERT_OR( not ssid.isEmpty() and not pwrd.isEmpty() ) {
-			ESP_LOGE( Tag, "service: inet: wifi credentials not set." );
-			return A113_ERR_LOGIC;
+			ESP_LOGE( Tag, "compound: inet: wifi credentials not set." );
+			return A113_ERR_NOT_FOUND;
 		}
 
 		WiFi.begin( ssid.c_str(), pwrd.c_str() );
@@ -323,43 +232,122 @@ protected:
 		do {
 			vTaskDelay( 1000_pdms2t );
 			A113_ASSERT_OR( ++wifi_tries < 5 ) {
-				ESP_LOGE( Tag, "service: inet: could not connect to wifi: %s", ssid.c_str() );
-				WiFi.disconnect();
+				ESP_LOGE( Tag, "compound: inet: could not connect to wifi: %s", ssid.c_str() );
 				return A113_ERR_PLATFORMCALL;
 			}
 		} while( WiFi.status() != WL_CONNECTED );
-		ESP_LOGI( Tag, "service: inet: connected to wifi: %s.", ssid.c_str() );
+		WifiClient.setInsecure();
+		ESP_LOGI( Tag, "compound: inet: connected to wifi: %s.", ssid.c_str() );
 
-		ESP_LOGI( Tag, "service: inet: started." );
+		ESP_LOGI( Tag, "compound: inet: started." );
 		return A113_OK;
 	}
 
-	virtual status_t _service_stop( void* ctx_ ) override {
+	virtual status_t _compound_stop( [[maybe_unused]]void* ) override {
 		WiFi.disconnect();
 		return A113_OK;
 	}
 
 } INet;
 
-struct _thingsboard_t {
-public:
-	status_t start( void ) {
-		ESP_LOGI( Tag, "service: thingsboard: starting..." );
+namespace _tb_cfg {
+	Server_Side_RPC< 3, 5 >                        rpc;
+	Attribute_Request< 2, MAX_ATTRIBUTES >         attr_request;
+	Shared_Attribute_Update< 3, MAX_ATTRIBUTES >   shared_update;
 
-		Storage.begin( Tag );
+	const std::array<IAPI_Implementation*, 3 >   apis   = {
+		&rpc,
+		&attr_request,
+		&shared_update
+	};
+
+	inline static constexpr std::array< const char*, 2 > SHARED_ATTRIBUTES_LIST = {
+		LED_STATE_ATTR,
+		BLINKING_INTERVAL_ATTR
+	};
+
+	inline static constexpr std::array< const char*, 1 > CLIENT_ATTRIBUTES_LIST = {
+		LED_MODE_ATTR
+	};
+
+	const std::array< RPC_Callback, 1 > callbacks = {
+		RPC_Callback{ "setLedMode", processSetLedMode }
+	};
+
+	const Shared_Attribute_Callback< MAX_ATTRIBUTES > attributes_callback(&processSharedAttributes, SHARED_ATTRIBUTES_LIST.cbegin(), SHARED_ATTRIBUTES_LIST.cend());
+	const Attribute_Request_Callback< MAX_ATTRIBUTES > attribute_shared_request_callback(&processSharedAttributes, REQUEST_TIMEOUT_MICROSECONDS, &requestTimedOut, SHARED_ATTRIBUTES_LIST);
+	const Attribute_Request_Callback< MAX_ATTRIBUTES > attribute_client_request_callback(&processClientAttributes, REQUEST_TIMEOUT_MICROSECONDS, &requestTimedOut, CLIENT_ATTRIBUTES_LIST);
+};
+struct _thingsboard_t : public Compound {
+protected:
+	status_t _compound_start( [[maybe_unused]]void* ) {
+		ESP_LOGI( Tag, "compound: thingsboard: starting..." );
+
+		Storage.begin( Tag, true );
 		auto server = Storage.getString( Storage_TB_SERVER, "" );
-		auto port   = Storage.getUInt( Storage_TB_PORT, 0x0 );
+		auto port   = Storage.getInt( Storage_TB_PORT, 0x0 );
 		auto token  = Storage.getString( Storage_TB_TOKEN, "" );
 		Storage.end();
-
-		A113_ASSERT_OR( not server.isEmpty() and not token.isEmpty() ) {
-			ESP_LOGE( Tag, "service: thingsboard: credentials not set." );
-			return A113_ERR_LOGIC;
+		
+		int cred_bits = ( ( not server.isEmpty() ) << 2 ) |
+						( ( port != 0x0 ) << 1 ) |
+						( not token.isEmpty() );
+		A113_ASSERT_OR( cred_bits == 0b111 ) { 
+			ESP_LOGE( Tag, "compound: thingsboard: credentials not set: %d.", cred_bits );
+			return A113_ERR_NOT_FOUND;
 		}
+		
+		A113_ASSERT_OR( _dev.connect( server.c_str(), token.c_str(), port ) ) {
+			ESP_LOGE( Tag, "compound: thingsboard: bad connection." );
+			return A113_ERR_EXCOMCALL;
+		}
+
+		A113_ASSERT_OR( _tb_cfg::rpc.RPC_Subscribe( _tb_cfg::callbacks.cbegin(), _tb_cfg::callbacks.cend() ) ) {
+			ESP_LOGE( Tag, "compound: thingsboard: bad rpc subscribe." );
+			return A113_ERR_EXCOMCALL;
+		}
+		
+		A113_ASSERT_OR( _tb_cfg::shared_update.Shared_Attributes_Subscribe( _tb_cfg::attributes_callback ) ) {
+			ESP_LOGE( Tag, "compound: thingsboard: bad shared subscribe." );
+			return A113_ERR_EXCOMCALL;
+		}
+
+		A113_ASSERT_OR( pdPASS == xTaskCreate(
+			&_thingsboard_t::_main, std::format( "{}/thingsboard/main", Tag ).c_str(),
+			8192, this, 4, &_tsk_main
+		) ) {
+			ESP_LOGE( Tag, "compound: thingsboard: bad main task create." );
+			return A113_ERR_SYSCALL;
+		}
+
+		ESP_LOGI( Tag, "compound: thinsgboard: started." );
+		return A113_OK;
+	}
+
+	status_t _compound_stop( [[maybe_unused]]void* ) {
+		return A113_OK;
 	}
 
 protected:
-	ThingsBoard   _dev   = { MqttClient, 1024, 8192, _apis };
+	ThingsBoard    _dev        = { MqttClient, 1024, 8192, _tb_cfg::apis };
+	TaskHandle_t   _tsk_main   = NULL;
+
+protected:
+	static void _main( void* self_ ) {
+		auto* self = ( _thingsboard_t* )self_;
+	for( ;; ) {
+		float temp = 0.0;
+		
+		Sns_BMP280.store_ctrl_meas( snsd::BMP280::CtrlMeas_TemperatureSampling_1x | snsd::BMP280::CtrlMeas_PressureSampling_1x | snsd::BMP280::CtrlMeas_Power_OneShot );
+		vTaskDelay( pdMS_TO_TICKS( 10 ) );
+		Sns_BMP280.load_data( &temp, nullptr );
+		Sns_BMP280.store_ctrl_meas( snsd::BMP280::CtrlMeas_Power_Low );
+		self->_dev.sendTelemetryData("temperature", temp);
+		self->_dev.loop();
+
+		vTaskDelay( 3000_pdms2t );
+	}
+	}
 	
 } Thingsboard;
 
@@ -388,23 +376,23 @@ extern "C" void app_main( void ) {
 	initArduino();
 	init_static();
 
-	INet.service_start( nullptr );
+	INet.compound_start( nullptr );
+	Thingsboard.compound_start( nullptr );
 	
 	auto last_serial_act  = esp_timer_get_time();
-	int  eff_serial_delay = 100;
+	int  eff_serial_delay = SERIAL_FAST_MS;
 	for(;;) {
 		vTaskDelay( pdMS_TO_TICKS( eff_serial_delay ) );
 		if( not Serial.available() ) {
-			if( esp_timer_get_time() - last_serial_act > 20000000 ) eff_serial_delay = 3000;
+			if( esp_timer_get_time() - last_serial_act > SERIAL_ACT_TO_US ) eff_serial_delay = SERIAL_IDLE_MS;
 			continue;
 		}
 		last_serial_act  = esp_timer_get_time();
-		eff_serial_delay = 100;
+		eff_serial_delay = SERIAL_FAST_MS;
 		
 		query_serial();
 	}
 }
-
 
 text::Fastcli Cli{
 	{}, {
@@ -424,7 +412,7 @@ text::Fastcli Cli{
 					break; }
 				}
 			}
-			stencil_ += "cli: systemctl: done.";
+			stencil_ += "cli: systemctl: done.\n";
 			return A113_OK;
 		}
 	}, {
@@ -433,30 +421,46 @@ text::Fastcli Cli{
 			{ .sh0rt = 's', .l0ng = Storage_WIFI_SSID, .arg = text::Fastcli::Arg_text },
 			{ .sh0rt = 'p', .l0ng = Storage_WIFI_PWRD, .arg = text::Fastcli::Arg_text },
 			{ .sh0rt = 'S', .l0ng = Storage_TB_SERVER, .arg = text::Fastcli::Arg_text },
-			{ .sh0rt = 'P', .l0ng = Storage_TB_PORT,   .arg = text::Fastcli::Arg_text },
+			{ .sh0rt = 'P', .l0ng = Storage_TB_PORT,   .arg = text::Fastcli::Arg_i32 },
 			{ .sh0rt = 't', .l0ng = Storage_TB_TOKEN,  .arg = text::Fastcli::Arg_text }
 		},
 		.fnc = [] ( auto& stencil_ ) -> status_t {
-			#define _W_NVS( what ) \
-				Storage.begin( Tag, false ); \
-				auto that = std::move( stencil_.arg_text() ); \
-				auto bcnt = Storage.putString( what, that.c_str() ); \
-				Storage.end(); \
-				A113_ASSERT_OR( bcnt == that.length() ) { \
-					stencil_( "cli: set: {}: bad flash write.", what ); \
-				}
-
 			char opt;  while( opt = stencil_.next() ) {
 				switch( opt ) { A113_TEXT_FASTCLI_DEFAULT_STENCIL_CASES
-					case 's': { _W_NVS( Storage_WIFI_SSID ); break; } 
-					case 'p': { _W_NVS( Storage_WIFI_PWRD ); break; }
-					case 'S': { _W_NVS( Storage_TB_SERVER ); break; }
-					case 'P': { _W_NVS( Storage_TB_PORT ); break; }
-					case 't': { _W_NVS( Storage_TB_TOKEN ); break; }
+					case 's': {
+						A113_ASSERT_OR( A113_OK == Storage.write< std::string >( Tag, Storage_WIFI_SSID, stencil_.arg_text() ) )
+							stencil_ += "cli: set wifi ssid: bad storage.\n";
+						else
+							stencil_ += "cli: set wifi ssid: ok.\n";
+					break; }
+					case 'p': {
+						A113_ASSERT_OR( A113_OK == Storage.write< std::string >( Tag, Storage_WIFI_PWRD, stencil_.arg_text() ) )
+							stencil_ += "cli: set wifi password: bad storage.\n";
+						else
+							stencil_ += "cli: set wifi ssid: ok.\n";
+					break; }
+					case 'S': {
+						A113_ASSERT_OR( A113_OK == Storage.write< std::string >( Tag, Storage_TB_SERVER, stencil_.arg_text() ) )
+							stencil_ += "cli: set tb server: bad storage.\n";
+						else
+							stencil_ += "cli: set tb server: ok.\n";
+					break; }
+					case 'P': {
+						A113_ASSERT_OR( A113_OK == Storage.write< int >( Tag, Storage_TB_PORT, stencil_.arg_i32() ) )
+							stencil_ += "cli: set tb port: bad storage.\n";
+						else
+							stencil_ += "cli: set tb port: ok.\n";
+					break; }
+					case 't': { 
+						A113_ASSERT_OR( A113_OK == Storage.write< std::string >( Tag, Storage_TB_TOKEN, stencil_.arg_text() ) )
+							stencil_ += "cli: set tb token: bad storage.\n";
+						else
+							stencil_ += "cli: set tb token: ok.\n";
+					break; }
 
 				}
 			}
-			stencil_ += "cli: set: done.";
+			stencil_ += "cli: set: done.\n";
 			return A113_OK;
 		}
 	} 
