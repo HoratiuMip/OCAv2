@@ -15,6 +15,7 @@ using namespace a113::freertos_literals;
 #include <a113/ucp/esp32-5x/IO_i2c.hpp>
 #include <a113/ucp/sns-drv/bmp280.hpp>
 #include <a113/ucp/sns-drv/aht21.hpp>
+#include <a113/ucp/compound.hpp>
 
 #include <Preferences.h>
 
@@ -67,6 +68,7 @@ struct config_t {
 const char* const           Tag           = "oca/wp-a";
 
 config_t                    Config        = {};
+CompoundCluster_FreeRTOS    CmpdCluster   = {};
 
 WiFiClientSecure            WifiClient    = {};
 Arduino_MQTT_Client         MqttClient    = { WifiClient };
@@ -155,6 +157,9 @@ constexpr i2c_device_config_t I2C_DEV_BMP280_CONFIG = {
 
 // ====== Compounds ======
 struct _inet_t : public Compound {
+public:
+	virtual std::string_view compound_name( void ) const { return "INet"; }
+
 protected:
 	virtual status_t _compound_start( [[maybe_unused]]void* ) override {
 		ESP_LOGI( Tag, "compound: inet: starting..." );
@@ -193,6 +198,9 @@ protected:
 } INet;
 
 struct _thingsboard_t : public Compound {
+public:
+	virtual std::string_view compound_name( void ) const { return "Thingsboard"; }
+
 protected:
 	static void _rpc_meas_now( const JsonVariantConst& arg_, JsonDocument& resp_ );
 	
@@ -329,7 +337,11 @@ protected:
 		self->_dev.loop();
 		vTaskDelay( 100_pdms2t );
 	}
+		vTaskDelete( NULL );
 	}
+
+public:
+	A113_inline bool connected( void ) { return _dev.connected(); }
 
 public:
 	void force_env( void ) { _prev_env = 0x0; }
@@ -391,11 +403,30 @@ extern "C" void app_main( void ) {
 
 	INet.compound_start( nullptr );
 	Thingsboard.compound_start( nullptr );
+
+	CmpdCluster.push( { .ref = INet, .restart_if = [] ( auto& ) -> status_t { 
+		A113_ASSERT_OR( WiFi.status() == WL_CONNECTED ) {
+			ESP_LOGW( Tag, "compound cluster: restarting INet." );
+			return A113_ERR_OPEN;
+		}
+		return A113_OK;
+	} } );
+	CmpdCluster.push( { .ref = Thingsboard, .restart_if = [] ( auto& ) -> status_t { 
+		A113_ASSERT_OR( Thingsboard.connected() ) {
+			ESP_LOGW( Tag, "compound cluster: restarting Thingsboard." );
+			return A113_ERR_OPEN;
+		}
+		return A113_OK;
+	} } );
+	CmpdCluster.init( {
+		.iterate_interval_ms = 5000
+	} );
 	
 	auto last_serial_act  = esp_timer_get_time();
 	int  eff_serial_delay = SERIAL_FAST_MS;
 	for(;;) {
 		vTaskDelay( pdMS_TO_TICKS( eff_serial_delay ) );
+
 		if( not Serial.available() ) {
 			if( esp_timer_get_time() - last_serial_act > SERIAL_ACT_TO_US ) eff_serial_delay = SERIAL_IDLE_MS;
 			continue;
