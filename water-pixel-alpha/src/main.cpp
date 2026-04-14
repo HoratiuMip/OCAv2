@@ -61,7 +61,9 @@ public:
 };
 
 struct config_t {
-	bool   meas_led   = false;
+	bool   meas_led              = false;
+	int    adc_soil_period_ms    = 20;
+	int    adc_soil_meas_count   = 20;
 };
 
 // ====== Fields ====== 
@@ -162,7 +164,7 @@ public:
 
 protected:
 	virtual status_t _compound_start( [[maybe_unused]]void* ) override {
-		ESP_LOGI( Tag, "compound: inet: starting..." );
+		ESP_LOGI( Tag, "inet: starting..." );
 
 		Storage.begin( Tag, true );
 		auto ssid = Storage.getString( STORAGE_WIFI_SSID, "" );
@@ -170,28 +172,30 @@ protected:
 		Storage.end();
 
 		A113_ASSERT_OR( not ssid.isEmpty() and not pwrd.isEmpty() ) {
-			ESP_LOGE( Tag, "compound: inet: wifi credentials not set." );
+			ESP_LOGE( Tag, "inet: wifi credentials not set." );
 			return A113_ERR_NOT_FOUND;
 		}
 
+		WiFi.mode( WIFI_STA );
+		WiFi.setAutoReconnect( true );
 		WiFi.begin( ssid.c_str(), pwrd.c_str() );
 		int wifi_tries = 0;
 		do {
 			vTaskDelay( 1000_pdms2t );
 			A113_ASSERT_OR( ++wifi_tries < 5 ) {
-				ESP_LOGE( Tag, "compound: inet: could not connect to wifi: %s", ssid.c_str() );
+				ESP_LOGE( Tag, "inet: could not connect to wifi: %s", ssid.c_str() );
 				return A113_ERR_PLATFORMCALL;
 			}
 		} while( WiFi.status() != WL_CONNECTED );
 		WifiClient.setInsecure();
-		ESP_LOGI( Tag, "compound: inet: connected to wifi: %s.", ssid.c_str() );
+		ESP_LOGI( Tag, "inet: connected to wifi: %s.", ssid.c_str() );
 
-		ESP_LOGI( Tag, "compound: inet: started." );
+		ESP_LOGI( Tag, "inet: started." );
 		return A113_OK;
 	}
 
 	virtual status_t _compound_stop( [[maybe_unused]]void* ) override {
-		WiFi.disconnect();
+		WiFi.disconnect( true );
 		return A113_OK;
 	}
 
@@ -223,7 +227,7 @@ protected:
 
 protected:
 	status_t _compound_start( [[maybe_unused]]void* ) {
-		ESP_LOGI( Tag, "compound: thingsboard: starting..." );
+		ESP_LOGI( Tag, "thingsboard: starting..." );
 
 		Storage.begin( Tag, true );
 		auto server = Storage.getString( STORAGE_TB_SERVER, "" );
@@ -235,31 +239,31 @@ protected:
 						( ( port != 0x0 ) << 1 ) |
 						( not token.isEmpty() );
 		A113_ASSERT_OR( cred_bits == 0b111 ) { 
-			ESP_LOGE( Tag, "compound: thingsboard: credentials not set: %d.", cred_bits );
+			ESP_LOGE( Tag, "thingsboard: credentials not set: %d.", cred_bits );
 			return A113_ERR_NOT_FOUND;
 		}
 		
 		A113_ASSERT_OR( _dev.connect( server.c_str(), token.c_str(), port ) ) {
-			ESP_LOGE( Tag, "compound: thingsboard: bad connection." );
+			ESP_LOGE( Tag, "thingsboard: bad connection." );
 			return A113_ERR_EXCOMCALL;
 		}
 
 		A113_ASSERT_OR( _rpc.RPC_Subscribe( _RPC_Callbacks.cbegin(), _RPC_Callbacks.cend() ) ) {
-			ESP_LOGE( Tag, "compound: thingsboard: bad rpc subscribe." );
+			ESP_LOGE( Tag, "thingsboard: bad rpc subscribe." );
 			return A113_ERR_EXCOMCALL;
 		}
 		
 		A113_ASSERT_OR( _shared_update.Shared_Attributes_Subscribe(
 			Shared_Attribute_Callback< UPPER_LIM_ATTR >{ &_attr_sh_update, _Attr_Shared.cbegin(), _Attr_Shared.cend() }
 		) ) {
-			ESP_LOGE( Tag, "compound: thingsboard: bad shared subscribe." );
+			ESP_LOGE( Tag, "thingsboard: bad shared subscribe." );
 			return A113_ERR_EXCOMCALL;
 		}
 
 		A113_ASSERT_OR( _attr_request.Shared_Attributes_Request(  
 			Attribute_Request_Callback< UPPER_LIM_ATTR >{ &_attr_sh_update, ATTR_REQ_TO_US, [](){}, _Attr_Shared }
 		) ) {
-			ESP_LOGE( Tag, "compound: thingsboard: bad shared request." );
+			ESP_LOGE( Tag, "thingsboard: bad shared request." );
 			return A113_ERR_EXCOMCALL;
 		}
 
@@ -267,7 +271,7 @@ protected:
 			&_thingsboard_t::_main, std::format( "{}/thingsboard/main", Tag ).c_str(),
 			8192, this, 4, &_tsk_main
 		) ) {
-			ESP_LOGE( Tag, "compound: thingsboard: bad main task create." );
+			ESP_LOGE( Tag, "thingsboard: bad main task create." );
 			return A113_ERR_SYSCALL;
 		}
 
@@ -276,6 +280,7 @@ protected:
 	}
 
 	status_t _compound_stop( [[maybe_unused]]void* ) {
+		while( _tsk_main ) vTaskDelay( 100_pdms2t );
 		_dev.disconnect();
 		return A113_OK;
 	}
@@ -307,10 +312,15 @@ protected:
 				float   hum_sol  = 0.0;
 			} env;
 
-			int voltage = 0; 
-			adc_oneshot_read( Adc_1, ADC_CHANNEL_2, &voltage );
-			adc_cali_raw_to_voltage( Adc_1_Cal, voltage, &voltage );
-			env.hum_sol = ( float )voltage / 1e3;
+			for( int n = 1; n <= Config.adc_soil_meas_count; ++n ) {
+				int voltage = 0; 
+				adc_oneshot_read( Adc_1, ADC_CHANNEL_2, &voltage );
+				adc_cali_raw_to_voltage( Adc_1_Cal, voltage, &voltage );
+				env.hum_sol += ( float )voltage;
+
+				vTaskDelay( pdMS_TO_TICKS( Config.adc_soil_period_ms ) );
+			}
+			env.hum_sol /= 1e3 * Config.adc_soil_meas_count;
 
 			self->_dev.sendTelemetryData( "humidity_soil", env.hum_sol );
 			
@@ -337,7 +347,7 @@ protected:
 		self->_dev.loop();
 		vTaskDelay( 100_pdms2t );
 	}
-		vTaskDelete( NULL );
+		vTaskDelete( self->_tsk_main = NULL );
 	}
 
 public:
@@ -349,13 +359,13 @@ public:
 } Thingsboard;
 
 void _thingsboard_t::_rpc_meas_now( const JsonVariantConst& arg_, JsonDocument& resp_ ) {
-	ESP_LOGI( Tag, "compound: thingsboard: executing rpc: meas-now..." );
+	ESP_LOGI( Tag, "thingsboard: executing rpc: meas-now..." );
 	Thingsboard.force_env();
-	ESP_LOGI( Tag, "compound: thingsboard: executed rpc: meas-now..." );
+	ESP_LOGI( Tag, "thingsboard: executed rpc: meas-now..." );
 }
 
 void _thingsboard_t::_attr_sh_update( const JsonObjectConst& arg_ ) {
-	ESP_LOGI( Tag, "compound: thingsboard: refreshing shared attribs..." );
+	ESP_LOGI( Tag, "thingsboard: refreshing shared attribs..." );
 
 	for( auto itr : arg_ ) {
 		switch( text::hash( itr.key().c_str() ) ) {
@@ -365,7 +375,7 @@ void _thingsboard_t::_attr_sh_update( const JsonObjectConst& arg_ ) {
 		}
 	}
 
-	ESP_LOGI( Tag, "compound: thingsboard: refreshed shared attribs." );
+	ESP_LOGI( Tag, "thingsboard: refreshed shared attribs." );
 }
 
 
@@ -393,6 +403,9 @@ status_t init_static( void ) {
 void query_serial( void );
 
 extern "C" void app_main( void ) {
+	auto last_serial_act  = esp_timer_get_time();
+	int  eff_serial_delay = SERIAL_FAST_MS;
+
 	vTaskPrioritySet( NULL, 5 ); 
 
 	Serial.begin( SERIAL_BAUD );
@@ -404,26 +417,27 @@ extern "C" void app_main( void ) {
 	INet.compound_start( nullptr );
 	Thingsboard.compound_start( nullptr );
 
-	CmpdCluster.push( { .ref = INet, .restart_if = [] ( auto& ) -> status_t { 
+	CmpdCluster.push( { .ref = INet, .restart_if = [] ( auto&, auto& args_ ) -> status_t { 
 		A113_ASSERT_OR( WiFi.status() == WL_CONNECTED ) {
 			ESP_LOGW( Tag, "compound cluster: restarting INet." );
 			return A113_ERR_OPEN;
 		}
 		return A113_OK;
 	} } );
-	CmpdCluster.push( { .ref = Thingsboard, .restart_if = [] ( auto& ) -> status_t { 
+	CmpdCluster.push( { .ref = Thingsboard, .restart_if = [] ( auto&, auto& args_ ) -> status_t { 
 		A113_ASSERT_OR( Thingsboard.connected() ) {
+			if( args_.attempt >= 5 && eff_serial_delay != SERIAL_FAST_MS ) esp_restart();
+
 			ESP_LOGW( Tag, "compound cluster: restarting Thingsboard." );
 			return A113_ERR_OPEN;
 		}
 		return A113_OK;
 	} } );
 	CmpdCluster.init( {
-		.iterate_interval_ms = 5000
+		.iterate_interval_ms = 5000,
+		.task_stack_depth    = CONFIG_ESP_MAIN_TASK_STACK_SIZE
 	} );
 	
-	auto last_serial_act  = esp_timer_get_time();
-	int  eff_serial_delay = SERIAL_FAST_MS;
 	for(;;) {
 		vTaskDelay( pdMS_TO_TICKS( eff_serial_delay ) );
 
@@ -451,7 +465,7 @@ text::Fastcli Cli{
 				switch( opt ) { A113_TEXT_FASTCLI_DEFAULT_STENCIL_CASES
 					case 'r': { 
 						switch( text::hash( stencil_.arg_text() ) ) {
-							case text::hash( "system" ): esp_restart(); *(volatile int*)0x0=*(int*)0x0; return A113_ERR_TERMINATED;
+							case text::hash( "system" ): esp_restart();
 							case text::hash( "storage" ): nvs_flash_erase(); break;
 						}
 					break; }
