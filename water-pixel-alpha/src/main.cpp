@@ -88,6 +88,10 @@ snsd::BMP280                Sns_BMP280    = {};
 storage_t                   Storage       = {};
 
 // ====== Configs ======
+constexpr UBaseType_t         MAIN_TASK_PRIO      = 5;
+constexpr UBaseType_t         CMPD_TASK_PRIO      = 5;
+constexpr UBaseType_t         TB_MAIN_TASK_PRIO   = 4;
+
 constexpr int                 SERIAL_BAUD         = 115200;
 constexpr int                 SERIAL_FAST_MS      = 100;
 constexpr int                 SERIAL_IDLE_MS      = 3000;
@@ -178,7 +182,9 @@ protected:
 
 		WiFi.mode( WIFI_STA );
 		WiFi.setAutoReconnect( true );
+
 		WiFi.begin( ssid.c_str(), pwrd.c_str() );
+
 		int wifi_tries = 0;
 		do {
 			vTaskDelay( 1000_pdms2t );
@@ -195,9 +201,11 @@ protected:
 	}
 
 	virtual status_t _compound_stop( [[maybe_unused]]void* ) override {
-		WiFi.disconnect( true );
 		return A113_OK;
 	}
+
+public:
+	A113_inline bool connected( void ) { return WiFi.status() == WL_CONNECTED; }
 
 } INet;
 
@@ -269,7 +277,7 @@ protected:
 
 		A113_ASSERT_OR( pdPASS == xTaskCreate(
 			&_thingsboard_t::_main, std::format( "{}/thingsboard/main", Tag ).c_str(),
-			8192, this, 4, &_tsk_main
+			8192, this, TB_MAIN_TASK_PRIO, &_tsk_main
 		) ) {
 			ESP_LOGE( Tag, "thingsboard: bad main task create." );
 			return A113_ERR_SYSCALL;
@@ -281,14 +289,13 @@ protected:
 
 	status_t _compound_stop( [[maybe_unused]]void* ) {
 		while( _tsk_main ) vTaskDelay( 100_pdms2t );
-		_dev.disconnect();
 		return A113_OK;
 	}
 
 protected:
-	ThingsBoard    _dev         = { MqttClient, 1024, 8192, _APIs };
-	TaskHandle_t   _tsk_main    = NULL;
-	int64_t        _prev_env    = 0x0;
+	ThingsBoardSized< 48 >   _dev        = { MqttClient, 1024, 8192, _APIs };
+	TaskHandle_t             _tsk_main   = NULL;
+	int64_t                  _prev_env   = 0x0;
 
 protected:
 	static void _main( void* self_ ) {
@@ -406,7 +413,7 @@ extern "C" void app_main( void ) {
 	auto last_serial_act  = esp_timer_get_time();
 	int  eff_serial_delay = SERIAL_FAST_MS;
 
-	vTaskPrioritySet( NULL, 5 ); 
+	vTaskPrioritySet( NULL, MAIN_TASK_PRIO ); 
 
 	Serial.begin( SERIAL_BAUD );
 	vTaskDelay( 1000_pdms2t );
@@ -414,28 +421,39 @@ extern "C" void app_main( void ) {
 	initArduino();
 	init_static();
 
-	INet.compound_start( nullptr );
-	Thingsboard.compound_start( nullptr );
-
-	CmpdCluster.push( { .ref = INet, .restart_if = [] ( auto&, auto& args_ ) -> status_t { 
-		A113_ASSERT_OR( WiFi.status() == WL_CONNECTED ) {
-			ESP_LOGW( Tag, "compound cluster: restarting INet." );
-			return A113_ERR_OPEN;
+	CmpdCluster.push( { 
+		.ref = INet, 
+		.keep_alive = true,
+		.restart_if = [] ( auto&, auto& args_ ) -> status_t { 
+			A113_ASSERT_OR( WiFi.status() == WL_CONNECTED ) {
+				ESP_LOGW( Tag, "compound cluster: restarting INet." );
+				return A113_ERR_OPEN;
+			}
+			return A113_OK;
 		}
-		return A113_OK;
-	} } );
-	CmpdCluster.push( { .ref = Thingsboard, .restart_if = [] ( auto&, auto& args_ ) -> status_t { 
-		A113_ASSERT_OR( Thingsboard.connected() ) {
-			if( args_.attempt >= 5 && eff_serial_delay != SERIAL_FAST_MS ) esp_restart();
+	} );
+	CmpdCluster.push( { 
+		.ref = Thingsboard, 
+		.deps = { INet },
+		.keep_alive = true,
+		.restart_if = [ &eff_serial_delay ] ( auto&, auto& args_ ) -> status_t { 
+			A113_ASSERT_OR( Thingsboard.connected() ) {
+				ESP_LOGW( Tag, "compound cluster: restarting Thingsboard." );
+				return A113_ERR_OPEN;
+			}
+			return A113_OK;
+		},
+		.critical_n_restarts = 3
+	} );
 
-			ESP_LOGW( Tag, "compound cluster: restarting Thingsboard." );
-			return A113_ERR_OPEN;
-		}
-		return A113_OK;
-	} } );
+	CmpdCluster.when_critical( [] ( auto ) -> void {
+		esp_restart();
+	} );
+
 	CmpdCluster.init( {
 		.iterate_interval_ms = 5000,
-		.task_stack_depth    = CONFIG_ESP_MAIN_TASK_STACK_SIZE
+		.task_stack_depth    = CONFIG_ESP_MAIN_TASK_STACK_SIZE,
+		.task_priority       = CMPD_TASK_PRIO
 	} );
 	
 	for(;;) {
@@ -496,7 +514,7 @@ text::Fastcli Cli{
 						A113_ASSERT_OR( A113_OK == Storage.write< std::string >( Tag, STORAGE_WIFI_PWRD, stencil_.arg_text() ) )
 							stencil_ += "cli: set wifi password: bad storage.\n";
 						else
-							stencil_ += "cli: set wifi ssid: ok.\n";
+							stencil_ += "cli: set wifi password: ok.\n";
 					break; }
 					case 'S': {
 						A113_ASSERT_OR( A113_OK == Storage.write< std::string >( Tag, STORAGE_TB_SERVER, stencil_.arg_text() ) )
