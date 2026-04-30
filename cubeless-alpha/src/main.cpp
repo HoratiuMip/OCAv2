@@ -3,8 +3,6 @@
 #include <esp_log.h>
 #include <nvs_flash.h>
 #include <driver/gpio.h>
-#include <esp_adc/adc_oneshot.h>
-#include <esp_adc/adc_cali.h>
 
 #include <rgh/gep/text_utils.hpp>
 #include <rgh/gep/fastcli.hpp>
@@ -12,9 +10,6 @@
 #include <rgh/ucp/core.hpp>
 using namespace rgh;
 using namespace rgh::freertos_literals;
-#include <rgh/ucp/esp32-5x/IO_i2c.hpp>
-#include <rgh/ucp/sns-drv/bmp280.hpp>
-#include <rgh/ucp/sns-drv/aht21.hpp>
 #include <rgh/ucp/compound.hpp>
 
 #include <Preferences.h>
@@ -26,6 +21,97 @@ using namespace rgh::freertos_literals;
 #include <Attribute_Request.h>
 #include <Shared_Attribute_Update.h>
 #include <ThingsBoard.h>
+
+
+template<
+
+
+	int SERIAL_BAUD_RATE_,
+	int SERIAL_FAST_MS_,
+	int SERIAL_IDLE_MS_,
+	int SERIAL_ACT_TO_MS_
+> class Thingsboard_clockwork {
+public:
+	Thingsboard_clockwork( void ) {
+		Serial.begin( SERIAL_BAUD_RATE_ );
+		vTaskDelay()
+	}
+
+public:
+	Fast_cli   Cli   = {
+		{}, {
+		{
+			.text = "systemctl",
+			.opts = {
+				{ .sh0rt = 'r', .l0ng = "restart", .arg = Fast_cli::Arg_text }
+			},
+			.fnc = [] ( auto& stencil_ ) -> status_t {
+				char opt;  while( opt = stencil_.next() ) {
+					switch( opt ) { RGH_FASTCLI_DEFAULT_STENCIL_CASES
+						case 'r': { 
+							switch( txt_hash( stencil_.arg_text() ) ) {
+								case txt_hash( "system" ): esp_restart();
+								case txt_hash( "storage" ): nvs_flash_erase(); break;
+							}
+						break; }
+					}
+				}
+				stencil_ += "cli: systemctl: done.\n";
+				return RGH_OK;
+			}
+		}, {
+			.text = "set",
+			.opts = {
+				{ .sh0rt = 's', .l0ng = STORAGE_WIFI_SSID, .arg = Fast_cli::Arg_text },
+				{ .sh0rt = 'p', .l0ng = STORAGE_WIFI_PWRD, .arg = Fast_cli::Arg_text },
+				{ .sh0rt = 'S', .l0ng = STORAGE_TB_SERVER, .arg = Fast_cli::Arg_text },
+				{ .sh0rt = 'P', .l0ng = STORAGE_TB_PORT,   .arg = Fast_cli::Arg_i32 },
+				{ .sh0rt = 't', .l0ng = STORAGE_TB_TOKEN,  .arg = Fast_cli::Arg_text }
+			},
+			.fnc = [] ( auto& stencil_ ) -> status_t {
+				char opt;  while( opt = stencil_.next() ) {
+					switch( opt ) { RGH_FASTCLI_DEFAULT_STENCIL_CASES
+						case 's': {
+							RGH_ASSERT_OR( RGH_OK == Storage.write< std::string >( Tag, STORAGE_WIFI_SSID, stencil_.arg_text() ) )
+								stencil_ += "cli: set wifi ssid: bad storage.\n";
+							else
+								stencil_ += "cli: set wifi ssid: ok.\n";
+						break; }
+						case 'p': {
+							RGH_ASSERT_OR( RGH_OK == Storage.write< std::string >( Tag, STORAGE_WIFI_PWRD, stencil_.arg_text() ) )
+								stencil_ += "cli: set wifi password: bad storage.\n";
+							else
+								stencil_ += "cli: set wifi password: ok.\n";
+						break; }
+						case 'S': {
+							RGH_ASSERT_OR( RGH_OK == Storage.write< std::string >( Tag, STORAGE_TB_SERVER, stencil_.arg_text() ) )
+								stencil_ += "cli: set tb server: bad storage.\n";
+							else
+								stencil_ += "cli: set tb server: ok.\n";
+						break; }
+						case 'P': {
+							RGH_ASSERT_OR( RGH_OK == Storage.write< int >( Tag, STORAGE_TB_PORT, stencil_.arg_i32() ) )
+								stencil_ += "cli: set tb port: bad storage.\n";
+							else
+								stencil_ += "cli: set tb port: ok.\n";
+						break; }
+						case 't': { 
+							RGH_ASSERT_OR( RGH_OK == Storage.write< std::string >( Tag, STORAGE_TB_TOKEN, stencil_.arg_text() ) )
+								stencil_ += "cli: set tb token: bad storage.\n";
+							else
+								stencil_ += "cli: set tb token: ok.\n";
+						break; }
+
+					}
+				}
+				stencil_ += "cli: set: done.\n";
+				return RGH_OK;
+			}
+		} 
+	} };
+
+};
+
 
 // ====== Structs ======
 struct storage_t : public Preferences {
@@ -61,29 +147,17 @@ public:
 };
 
 struct config_t {
-	bool   meas_led              = false;
-	int    adc_soil_period_ms    = 20;
-	int    adc_soil_meas_count   = 20;
+	
 };
 
 // ====== Fields ====== 
-const char* const           Tag           = "oca/wp-a";
+const char* const           Tag           = "oca/cbls-a";
 
 config_t                    Config        = {};
 Compound_cluster_FreeRTOS   CmpdCluster   = {};
 
 WiFiClientSecure            WifiClient    = {};
 Arduino_MQTT_Client         MqttClient    = { WifiClient };
-
-adc_oneshot_unit_handle_t   Adc_1         = NULL;
-adc_cali_handle_t           Adc_1_Cal     = NULL;
-
-i2c_master_bus_handle_t     I2C_Bus0      = NULL;
-esp32::io::I2C_m2s          I2C_AHT21     = {};
-esp32::io::I2C_m2s          I2C_BMP280    = {};
-
-snsd::AHT21                 Sns_AHT21     = {};
-snsd::BMP280                Sns_BMP280    = {};
 
 storage_t                   Storage       = {};
 
@@ -97,8 +171,6 @@ constexpr int                 SERIAL_FAST_MS      = 100;
 constexpr int                 SERIAL_IDLE_MS      = 3000;
 constexpr int                 SERIAL_ACT_TO_US    = 20000000;
 
-constexpr int                 MEAS_INTERVAL_MS    = 30000;
-
 constexpr const char* const   STORAGE_WIFI_SSID   = "wifi-ssid";
 constexpr const char* const   STORAGE_WIFI_PWRD   = "wifi-pwrd";
 constexpr const char* const   STORAGE_TB_SERVER   = "tb-server";
@@ -107,59 +179,6 @@ constexpr const char* const   STORAGE_TB_TOKEN    = "tb-token";
 
 constexpr int                 UPPER_LIM_ATTR      = 3;
 constexpr int                 ATTR_REQ_TO_US      = 10000000;
-constexpr gpio_num_t          GPIO_MEAS_LED_NUM   = GPIO_NUM_7;
-constexpr const char* const   ATTR_SH_MEAS_LED    = "meas-led";
-
-constexpr adc_oneshot_unit_init_cfg_t ADC_UNIT_1_CONFIG = {
-	.unit_id  = ADC_UNIT_1,
-	.clk_src  = ADC_DIGI_CLK_SRC_DEFAULT,
-	.ulp_mode = ADC_ULP_MODE_DISABLE
-};
-
-constexpr adc_oneshot_chan_cfg_t ADC_SOIL_MOISTURE_CHANNEL_CONFIG = {
-	.atten    = ADC_ATTEN_DB_12,
-	.bitwidth = ADC_BITWIDTH_12
-};
-
-constexpr adc_cali_curve_fitting_config_t ADC_SOIL_MOISTURE_CAL_CONFIG = {
-	.unit_id  = ADC_UNIT_1,
-	.chan     = ADC_CHANNEL_2,
-	.atten    = ADC_ATTEN_DB_12,
-	.bitwidth = ADC_BITWIDTH_12
-};
-
-constexpr gpio_config_t GPIO_MEAS_LED_CONFIG = {
-	.pin_bit_mask = 0x1ULL << GPIO_MEAS_LED_NUM,
-	.mode         = GPIO_MODE_OUTPUT,
-	.pull_up_en   = GPIO_PULLUP_DISABLE,
-	.pull_down_en = GPIO_PULLDOWN_DISABLE,
-	.intr_type    = GPIO_INTR_DISABLE
-};
-
-constexpr i2c_master_bus_config_t I2C_BUS_0_CONFIG = {
-	.i2c_port          = I2C_NUM_0,
-	.sda_io_num        = GPIO_NUM_8,
-	.scl_io_num        = GPIO_NUM_9,
-	.clk_source        = I2C_CLK_SRC_DEFAULT,
-	.glitch_ignore_cnt = 7,
-	.trans_queue_depth = 0x0,
-	.flags             = {
-		.enable_internal_pullup = false,
-		.allow_pd               = false
-	}
-};
-
-constexpr i2c_device_config_t I2C_DEV_AHT21_CONFIG = {
-	.dev_addr_length = I2C_ADDR_BIT_LEN_7,
-	.device_address  = snsd::AHT21::I2C_ADDRESS,
-	.scl_speed_hz    = 100000,
-};
-
-constexpr i2c_device_config_t I2C_DEV_BMP280_CONFIG = {
-	.dev_addr_length = I2C_ADDR_BIT_LEN_7,
-	.device_address  = snsd::BMP280::I2C_ADDRESS_SDO_VCC,
-	.scl_speed_hz    = 100000,
-};
 
 // ====== Compounds ======
 struct _inet_t : public Compound {
@@ -214,8 +233,9 @@ public:
 	virtual std::string_view compound_name( void ) const { return "Thingsboard"; }
 
 protected:
-	static void _rpc_meas_now( const JsonVariantConst& arg_, JsonDocument& resp_ );
-	
+	static void _rpc_hello_there( const JsonVariantConst& arg_, JsonDocument& resp_ );
+
+protected:
 	static void _attr_sh_update( const JsonObjectConst& arg_ );
 
 protected:
@@ -227,10 +247,10 @@ protected:
 		&_rpc, &_attr_request, &_shared_update
 	};
 	inline static const std::array< RPC_Callback, 1 >            _RPC_Callbacks   = {
-		RPC_Callback{ "meas-now", _rpc_meas_now }
+		RPC_Callback{ "hello-there", _rpc_hello_there }
 	};
 	inline static const std::array< const char*, 1 >             _Attr_Shared     = {
-		ATTR_SH_MEAS_LED
+		""
 	};
 
 protected:
@@ -302,55 +322,7 @@ protected:
 		auto*   self   = ( _thingsboard_t* )self_;
 	
 	for(; self->compound_is_up();) {
-		int64_t t_now = esp_timer_get_time() / 1000;
-
-		if( t_now - self->_prev_env > MEAS_INTERVAL_MS ) {
-			self->_prev_env = t_now;
-
-			if( Config.meas_led ) {
-				gpio_set_level( GPIO_MEAS_LED_NUM, HIGH );
-			}
-
-			struct {
-				float   temp_a   = 0.0;
-				float   temp_b   = 0.0;
-				float   press    = 0.0;
-				float   hum_air  = 0.0;
-				float   hum_sol  = 0.0;
-			} env;
-
-			for( int n = 1; n <= Config.adc_soil_meas_count; ++n ) {
-				int voltage = 0; 
-				adc_oneshot_read( Adc_1, ADC_CHANNEL_2, &voltage );
-				adc_cali_raw_to_voltage( Adc_1_Cal, voltage, &voltage );
-				env.hum_sol += ( float )voltage;
-
-				vTaskDelay( pdMS_TO_TICKS( Config.adc_soil_period_ms ) );
-			}
-			env.hum_sol /= 1e3 * Config.adc_soil_meas_count;
-
-			self->_dev.sendTelemetryData( "humidity_soil", env.hum_sol );
-			
-			Sns_BMP280.store_ctrl_meas( snsd::BMP280::CtrlMeas_TemperatureSampling_1x | snsd::BMP280::CtrlMeas_PressureSampling_1x | snsd::BMP280::CtrlMeas_Power_OneShot );
-			vTaskDelay( 20_pdms2t );
-			Sns_BMP280.load_data( &env.temp_a, &env.press );
-			Sns_BMP280.store_ctrl_meas( snsd::BMP280::CtrlMeas_Power_Low );
-
-			self->_dev.sendTelemetryData( "temperature_a", env.temp_a );
-			self->_dev.sendTelemetryData( "pressure", env.press );
-
-			Sns_AHT21.one_shot();
-			vTaskDelay( 70_pdms2t );
-			Sns_AHT21.load_data( &env.temp_b, &env.hum_air );
-
-			self->_dev.sendTelemetryData( "temperature_b", env.temp_b );
-			self->_dev.sendTelemetryData( "humidity_air", env.hum_air );
-
-			gpio_set_level( GPIO_MEAS_LED_NUM, LOW );
-
-			self->_dev.sendAttributeData( "wifi_rssi", WiFi.RSSI() ); 
-		}
-
+		
 		self->_dev.loop();
 		vTaskDelay( 100_pdms2t );
 	}
@@ -359,51 +331,27 @@ protected:
 
 public:
 	RGH_inline bool connected( void ) { return _dev.connected(); }
-
-public:
-	void force_env( void ) { _prev_env = 0x0; }
 	
 } Thingsboard;
-
-void _thingsboard_t::_rpc_meas_now( const JsonVariantConst& arg_, JsonDocument& resp_ ) {
-	ESP_LOGI( Tag, "thingsboard: executing rpc: meas-now..." );
-	Thingsboard.force_env();
-	ESP_LOGI( Tag, "thingsboard: executed rpc: meas-now..." );
-}
 
 void _thingsboard_t::_attr_sh_update( const JsonObjectConst& arg_ ) {
 	ESP_LOGI( Tag, "thingsboard: refreshing shared attribs..." );
 
 	for( auto itr : arg_ ) {
 		switch( txt_hash( itr.key().c_str() ) ) {
-			case txt_hash( ATTR_SH_MEAS_LED ): {
-				Config.meas_led = itr.value().as< uint16_t >();
-			break; }
 		}
 	}
 
 	ESP_LOGI( Tag, "thingsboard: refreshed shared attribs." );
 }
 
+void _thingsboard_t::_rpc_hello_there( const JsonVariantConst& arg_, JsonDocument& resp_ ) {
+	ESP_LOGI( Tag, "thingsboard: rpc: hello there!" );
+}
+
 
 // ====== Main ======
 status_t init_static( void ) {
-	adc_oneshot_new_unit( &ADC_UNIT_1_CONFIG, &Adc_1 );
-	adc_oneshot_config_channel( Adc_1, ADC_CHANNEL_2, &ADC_SOIL_MOISTURE_CHANNEL_CONFIG );
-	adc_cali_create_scheme_curve_fitting( &ADC_SOIL_MOISTURE_CAL_CONFIG, &Adc_1_Cal );
-
-	gpio_config( &GPIO_MEAS_LED_CONFIG );
-
-	i2c_new_master_bus( &I2C_BUS_0_CONFIG, &I2C_Bus0 );
-	I2C_AHT21.bind( I2C_Bus0, I2C_DEV_AHT21_CONFIG, 50 );
-	I2C_BMP280.bind( I2C_Bus0, I2C_DEV_BMP280_CONFIG, 50 );
-	
-	Sns_AHT21.bind_i2c( &I2C_AHT21 ); 
-	Sns_AHT21.calib();
-	
-	Sns_BMP280.bind_i2c( &I2C_BMP280 );
-	Sns_BMP280.load_calibs();
-
 	return RGH_OK;
 }
 
@@ -424,7 +372,7 @@ extern "C" void app_main( void ) {
 	CmpdCluster.push( { 
 		.ref = INet, 
 		.keep_alive = true,
-		.restart_if = [] ( auto&, auto& args_ ) -> status_t { 
+		.restart_if = [] ( [[maybe_unused]]auto&, auto& args_ ) -> status_t { 
 			RGH_ASSERT_OR( WiFi.status() == WL_CONNECTED ) {
 				ESP_LOGW( Tag, "compound cluster: restarting INet." );
 				return RGH_ERR_OPEN;
@@ -436,7 +384,7 @@ extern "C" void app_main( void ) {
 		.ref = Thingsboard, 
 		.deps = { INet },
 		.keep_alive = true,
-		.restart_if = [ &eff_serial_delay ] ( auto&, auto& args_ ) -> status_t { 
+		.restart_if = [] ( [[maybe_unused]]auto&, auto& args_ ) -> status_t { 
 			RGH_ASSERT_OR( Thingsboard.connected() ) {
 				ESP_LOGW( Tag, "compound cluster: restarting Thingsboard." );
 				return RGH_ERR_OPEN;
@@ -471,77 +419,6 @@ extern "C" void app_main( void ) {
 }
 
 // ====== Cli ======
-Fast_cli Cli{
-	{}, {
-	{
-		.text = "systemctl",
-		.opts = {
-			{ .sh0rt = 'r', .l0ng = "restart", .arg = Fast_cli::Arg_text }
-		},
-		.fnc = [] ( auto& stencil_ ) -> status_t {
-			char opt;  while( opt = stencil_.next() ) {
-				switch( opt ) { RGH_FASTCLI_DEFAULT_STENCIL_CASES
-					case 'r': { 
-						switch( txt_hash( stencil_.arg_text() ) ) {
-							case txt_hash( "system" ): esp_restart();
-							case txt_hash( "storage" ): nvs_flash_erase(); break;
-						}
-					break; }
-				}
-			}
-			stencil_ += "cli: systemctl: done.\n";
-			return RGH_OK;
-		}
-	}, {
-		.text = "set",
-		.opts = {
-			{ .sh0rt = 's', .l0ng = STORAGE_WIFI_SSID, .arg = Fast_cli::Arg_text },
-			{ .sh0rt = 'p', .l0ng = STORAGE_WIFI_PWRD, .arg = Fast_cli::Arg_text },
-			{ .sh0rt = 'S', .l0ng = STORAGE_TB_SERVER, .arg = Fast_cli::Arg_text },
-			{ .sh0rt = 'P', .l0ng = STORAGE_TB_PORT,   .arg = Fast_cli::Arg_i32 },
-			{ .sh0rt = 't', .l0ng = STORAGE_TB_TOKEN,  .arg = Fast_cli::Arg_text }
-		},
-		.fnc = [] ( auto& stencil_ ) -> status_t {
-			char opt;  while( opt = stencil_.next() ) {
-				switch( opt ) { RGH_FASTCLI_DEFAULT_STENCIL_CASES
-					case 's': {
-						RGH_ASSERT_OR( RGH_OK == Storage.write< std::string >( Tag, STORAGE_WIFI_SSID, stencil_.arg_text() ) )
-							stencil_ += "cli: set wifi ssid: bad storage.\n";
-						else
-							stencil_ += "cli: set wifi ssid: ok.\n";
-					break; }
-					case 'p': {
-						RGH_ASSERT_OR( RGH_OK == Storage.write< std::string >( Tag, STORAGE_WIFI_PWRD, stencil_.arg_text() ) )
-							stencil_ += "cli: set wifi password: bad storage.\n";
-						else
-							stencil_ += "cli: set wifi password: ok.\n";
-					break; }
-					case 'S': {
-						RGH_ASSERT_OR( RGH_OK == Storage.write< std::string >( Tag, STORAGE_TB_SERVER, stencil_.arg_text() ) )
-							stencil_ += "cli: set tb server: bad storage.\n";
-						else
-							stencil_ += "cli: set tb server: ok.\n";
-					break; }
-					case 'P': {
-						RGH_ASSERT_OR( RGH_OK == Storage.write< int >( Tag, STORAGE_TB_PORT, stencil_.arg_i32() ) )
-							stencil_ += "cli: set tb port: bad storage.\n";
-						else
-							stencil_ += "cli: set tb port: ok.\n";
-					break; }
-					case 't': { 
-						RGH_ASSERT_OR( RGH_OK == Storage.write< std::string >( Tag, STORAGE_TB_TOKEN, stencil_.arg_text() ) )
-							stencil_ += "cli: set tb token: bad storage.\n";
-						else
-							stencil_ += "cli: set tb token: ok.\n";
-					break; }
-
-				}
-			}
-			stencil_ += "cli: set: done.\n";
-			return RGH_OK;
-		}
-	} 
-} };
 
 void query_serial( void ) { 
 	auto line = Serial.readStringUntil( '\n' );
