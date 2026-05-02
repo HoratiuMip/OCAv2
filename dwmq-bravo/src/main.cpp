@@ -1,3 +1,9 @@
+/**
+ * @brief: DWQM version Bravo.
+ * @details: Technics SA-EX500 retrofit firmware.
+ * @authors: Vatca "Mipsan" Tudor-Horatiu
+ */
+
 #include <Arduino.h>
 #undef _BV
 
@@ -10,9 +16,11 @@
 #include <rgh/gep/divergent_ring.hpp>
 
 #include <rgh/ucp/core.hpp>
+#include <rgh/ucp/compound.hpp>
+#include <rgh/ucp/esp32-5x/IO_i2c.hpp>
+#include <rgh/ucp/sns-drv/bmp280.hpp>
 using namespace rgh;
 using namespace rgh::freertos_literals;
-#include <rgh/ucp/compound.hpp>
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -24,9 +32,10 @@ using namespace rgh::freertos_literals;
 #include <ThingsBoard.h>
 
 // ====== Configs ======
-const char* const             Tag                   = "oca/dwmq-b";
+const char* const             Tag                  = "oca/dwmq-b";
 
 constexpr UBaseType_t         MAIN_TASK_PRIO       = 5;
+constexpr UBaseType_t         SYSCTL_TASK_PRIO     = 5;
 constexpr UBaseType_t         CMPD_TASK_PRIO       = 5;
 constexpr UBaseType_t         TB_MAIN_TASK_PRIO    = 5;
 
@@ -34,6 +43,8 @@ constexpr int                 SERIAL_BAUD_RATE     = 115200;
 constexpr int                 SERIAL_FAST_MS       = 100;
 constexpr int                 SERIAL_IDLE_MS       = 3000;
 constexpr int                 SERIAL_ACT_TO_US     = 20000000;
+
+constexpr int                 SYSSTATE_KEEP_MS     = 10000;
 
 constexpr gpio_num_t          GPIO_NUM_PWR_OPTO    = GPIO_NUM_32;
 constexpr gpio_num_t          GPIO_NUM_PWR_RL      = GPIO_NUM_25;
@@ -58,6 +69,43 @@ constexpr const char* const   ATTR_BLUETOOTH       = "bluetooth";
 constexpr const char* const   ATTR_FANS            = "fans";
 constexpr const char* const   ATTR_LIGHT_STRIP     = "light-strip";
 constexpr const char* const   ATTR_GAUGE           = "gauge";
+constexpr const char* const   ATTR_HEATSINK_TEMP   = "heatsink-temp";
+constexpr const char* const   ATTR_WIFI_RSSI       = "wifi-rssi";
+
+constexpr gpio_config_t GPIO_PWR_OPTO_CONFIG = {
+	.pin_bit_mask = _BV( GPIO_NUM_PWR_OPTO ),
+	.mode         = GPIO_MODE_INPUT,
+	.pull_up_en   = GPIO_PULLUP_ENABLE,
+	.pull_down_en = GPIO_PULLDOWN_DISABLE,
+	.intr_type    = GPIO_INTR_DISABLE
+};
+
+constexpr gpio_config_t GPIO_RELAY_CONFIG = {
+	.mode         = GPIO_MODE_INPUT_OUTPUT_OD,
+	.pull_up_en   = GPIO_PULLUP_DISABLE,
+	.pull_down_en = GPIO_PULLDOWN_DISABLE,
+	.intr_type    = GPIO_INTR_DISABLE
+};
+
+constexpr i2c_master_bus_config_t I2C_BUS_0_CONFIG = {
+	.i2c_port          = I2C_NUM_0,
+	.sda_io_num        = GPIO_NUM_21,
+	.scl_io_num        = GPIO_NUM_22,
+	.clk_source        = I2C_CLK_SRC_DEFAULT,
+	.glitch_ignore_cnt = 7,
+	.trans_queue_depth = 0x0,
+	.flags             = {
+		.enable_internal_pullup = false,
+		.allow_pd               = false
+	}
+};
+
+constexpr i2c_device_config_t I2C_DEV_BMP280_CONFIG = {
+	.dev_addr_length = I2C_ADDR_BIT_LEN_7,
+	.device_address  = snsd::BMP280::I2C_ADDRESS_SDO_GND,
+	.scl_speed_hz    = 100000,
+};
+
 
 // ====== Fields ====== 
 struct storage_t : public Preferences {
@@ -92,25 +140,29 @@ public:
 	}
 } Storage;
 
+struct system_state_t {
+	struct _ctl_t {
+		uint8_t   power    : 1;
+		uint8_t   blue     : 1;
+		uint8_t   fans     : 1;
+		uint8_t   lights   : 1;
+	} ctl;
+
+	struct _mtr_t {
+		float   heatsink_temp   = 0.0;
+	} mtr;
+};
+
+Divergent_ring_dynamic_STL< system_state_t >   SysState      = { SYSSTATE_KEEP_MS };
+Compound_cluster_FreeRTOS                      CmpdCluster   = {};
+
+i2c_master_bus_handle_t                        I2C_Bus0      = NULL;
+esp32::io::I2C_m2s                             I2C_BMP280    = {};
+snsd::BMP280                                   HS_BMP280     = {};
+
 class System_ctl {
 public:
-	inline static constexpr gpio_config_t GPIO_PWR_OPTO_CONFIG = {
-		.pin_bit_mask = _BV( GPIO_NUM_PWR_OPTO ),
-		.mode         = GPIO_MODE_INPUT,
-		.pull_up_en   = GPIO_PULLUP_ENABLE,
-		.pull_down_en = GPIO_PULLDOWN_DISABLE,
-		.intr_type    = GPIO_INTR_DISABLE
-	};
-
-	inline static constexpr gpio_config_t GPIO_RELAY_CONFIG = {
-		.mode         = GPIO_MODE_OUTPUT_OD,
-		.pull_up_en   = GPIO_PULLUP_DISABLE,
-		.pull_down_en = GPIO_PULLDOWN_DISABLE,
-		.intr_type    = GPIO_INTR_DISABLE
-	};
-
-public:
-	System_ctl( void ) {
+	status_t init( void ) {
 		gpio_config( &GPIO_PWR_OPTO_CONFIG );
 
 		auto gpio_rl_cfg = GPIO_RELAY_CONFIG;
@@ -122,7 +174,47 @@ public:
 								   _BV( GPIO_NUM_LSTR_RL );
 		this->open_relays();
 		gpio_config( &gpio_rl_cfg );
+
+		i2c_new_master_bus( &I2C_BUS_0_CONFIG, &I2C_Bus0 );
+		I2C_BMP280.bind( I2C_Bus0, I2C_DEV_BMP280_CONFIG, 100 );
+		
+		HS_BMP280.bind_i2c( &I2C_BMP280 );
+		HS_BMP280.load_calibs();
+
+		RGH_ASSERT_OR( pdPASS == xTaskCreate(
+			&System_ctl::_main, std::format( "{}/sysctl/main", Tag ).c_str(),
+			8192, this, SYSCTL_TASK_PRIO, &_tsk_main
+		) ) {
+			ESP_LOGE( Tag, "systemctl: bad task create." );
+			return RGH_ERR_SYSCALL;
+		}
+
+		return RGH_OK;
 	}
+
+_RGH_PROTECTED:
+	TaskHandle_t   _tsk_main   = {};
+
+_RGH_PROTECTED:
+	static void _main( void* arg_ ) {
+		auto* self = ( System_ctl* )arg_;
+
+	for(;;) {
+		system_state_t sys_state;
+
+		sys_state.ctl.power  = gpio_get_level( GPIO_NUM_PWR_OPTO ) == RESET;
+		sys_state.ctl.blue   = gpio_get_level( GPIO_NUM_PWR_RL )   == RESET;
+		sys_state.ctl.fans   = gpio_get_level( GPIO_NUM_FANS_RL )  == RESET;
+		sys_state.ctl.lights = gpio_get_level( GPIO_NUM_LSTR_RL )  == RESET;
+
+		HS_BMP280.store_ctrl_meas( snsd::BMP280::CtrlMeas_TemperatureSampling_1x | snsd::BMP280::CtrlMeas_PressureSampling_1x | snsd::BMP280::CtrlMeas_Power_OneShot );
+		vTaskDelay( 20_pdms2t );
+		HS_BMP280.load_data( &sys_state.mtr.heatsink_temp, nullptr );
+
+		SysState.enring( std::move( sys_state ) );
+		
+		vTaskDelay( 1000_pdms2t );
+	} }
 
 _RGH_PROTECTED:
 	template< typename ...GPIO_NUMS >
@@ -181,8 +273,6 @@ public:
 	}
 
 } Systemctl;
-
-Compound_cluster_FreeRTOS   CmpdCluster   = {};
 
 class TB_on_WiFi {
 _RGH_PROTECTED:
@@ -264,6 +354,9 @@ _RGH_PROTECTED:
 		}
 
 		virtual status_t _compound_stop( [[maybe_unused]]void* ) override {
+			_hyper._MqttClient.disconnect();
+			_hyper._WifiClient.stop();
+			WiFi.disconnect();
 			return RGH_OK;
 		}
 
@@ -293,14 +386,15 @@ _RGH_PROTECTED:
 		const std::array< IAPI_Implementation*, 3 >    _APIs   = {
 			&_rpc, &_attr_request, &_shared_update
 		};
-		const std::array< RPC_Callback, 1 >            _RPC_Callbacks   = {
-			RPC_Callback{ "hello-there", _rpc_hello_there }
+		const std::array< RPC_Callback, 0 >            _RPC_Callbacks   = {
+
 		};
-		const std::array< const char*, 4 >             _Attr_Shared     = {
+		const std::array< const char*, 5 >             _Attr_Shared     = {
 			ATTR_POWER,
 			ATTR_BLUETOOTH,
 			ATTR_FANS,
-			ATTR_LIGHT_STRIP
+			ATTR_LIGHT_STRIP,
+			ATTR_GAUGE
 		};
 
 	_RGH_PROTECTED:
@@ -359,6 +453,7 @@ _RGH_PROTECTED:
 
 		status_t _compound_stop( [[maybe_unused]]void* ) {
 			while( _tsk_main ) vTaskDelay( 100_pdms2t );
+			_dev.disconnect();
 			return RGH_OK;
 		}
 
@@ -369,11 +464,30 @@ _RGH_PROTECTED:
 
 	_RGH_PROTECTED:
 		static void _main( void* self_ ) {
-			auto*   self   = ( _thingsboard_t* )self_;
-		
+			auto* self           = ( _thingsboard_t* )self_;
+			auto  prev_sys_state = SysState.dering_far_or( 0xFFFFFFFF, 10000, {} ); 
+			auto  prev_telmtr    = 0x0;
+
 		for(; self->compound_is_up();) {
+			vTaskDelay( 150_pdms2t );
+			if( auto sys_state = SysState.dering_far( 5000, 100 ) ) {
+				// const auto &ctl = sys_state->ctl, &pctl = prev_sys_state.ctl;
+				// if( ctl.power != pctl.power )   self->_dev.sendAttributeData( ATTR_POWER, ctl.power ); 
+				// if( ctl.blue != pctl.blue )     self->_dev.sendAttributeData( ATTR_BLUETOOTH, ctl.blue ); 
+				// if( ctl.fans != pctl.fans )     self->_dev.sendAttributeData( ATTR_FANS, ctl.fans ); 
+				// if( ctl.lights != pctl.lights ) self->_dev.sendAttributeData( ATTR_LIGHT_STRIP, ctl.lights );
+
+				if( auto t_telmtr = esp_timer_get_time(); sys_state->ctl.power && t_telmtr - prev_telmtr >= 60'000'000 ) {
+					prev_telmtr = t_telmtr;
+
+					self->_dev.sendTelemetryData( ATTR_HEATSINK_TEMP, sys_state->mtr.heatsink_temp );
+					self->_dev.sendAttributeData( ATTR_WIFI_RSSI, WiFi.RSSI() );
+				}
+
+				prev_sys_state = *sys_state;
+			}
+
 			self->_dev.loop();
-			vTaskDelay( 250_pdms2t );
 		}
 			vTaskDelete( self->_tsk_main = NULL );
 		}
@@ -395,6 +509,8 @@ void critical_handler( void ) {
 }
 
 status_t init_static( void ) {
+	Systemctl.init();
+
 	CmpdCluster.when_critical( [] ( [[maybe_unused]]auto ) -> void { critical_handler(); } );
 	CmpdCluster.init( {
 		.iterate_interval_ms = CHECK_COMPOUNDS_MS,
@@ -437,14 +553,17 @@ extern "C" void app_main( void ) {
 void TB_on_WiFi::_thingsboard_t::_attr_sh_update( const JsonObjectConst& arg_ ) {
 	ESP_LOGI( Tag, "thingsboard: refreshing shared attribs..." );
 
+	uint8_t but_gauge = false;
+	float   lvl_gauge = -1;
+
 	for( auto itr : arg_ ) { switch( txt_hash( itr.key().c_str() ) ) {
 		case txt_hash( ATTR_GAUGE ): {
-			auto pwr = ( int )itr.value().as< float >();
-
+		    lvl_gauge = ( int )itr.value().as< float >();
 		break; }
 		
 	#define _ATTR_ON_OFF( attr, func ) \
 		case txt_hash( attr ): { \
+			but_gauge = true; \
 			if( itr.value().as< uint16_t >() ) Systemctl.func##_on(); else Systemctl.func##_off(); \
 		break; }
 		_ATTR_ON_OFF( ATTR_POWER, power )
@@ -454,11 +573,18 @@ void TB_on_WiFi::_thingsboard_t::_attr_sh_update( const JsonObjectConst& arg_ ) 
 	#undef _ATTR_ON_OFF
 	} }
 
-	ESP_LOGI( Tag, "thingsboard: refreshed shared attribs." );
-}
+	if( not but_gauge && lvl_gauge >= 0 && lvl_gauge <= 100 ) {
+		if( lvl_gauge >= 25.0 ) { Systemctl.bluetooth_on();    vTaskDelay( 1000_pdms2t ); }
+		if( lvl_gauge >= 50.0 ) { Systemctl.light_strip_on();  vTaskDelay( 1000_pdms2t ); }
+		if( lvl_gauge >= 75.0 ) { Systemctl.fans_on();         vTaskDelay( 1000_pdms2t ); }
+		if( lvl_gauge >= 95.0 ) { Systemctl.power_on();        vTaskDelay( 1000_pdms2t ); }
+		else                    { Systemctl.power_off();       vTaskDelay( 1000_pdms2t ); }
+		if( lvl_gauge < 75.0 )  { Systemctl.fans_off();        vTaskDelay( 1000_pdms2t ); }
+		if( lvl_gauge < 50.0 )  { Systemctl.light_strip_off(); vTaskDelay( 1000_pdms2t ); }
+		if( lvl_gauge < 25.0 )  { Systemctl.bluetooth_off();   vTaskDelay( 1000_pdms2t ); }
+	}
 
-void TB_on_WiFi::_thingsboard_t::_rpc_hello_there( const JsonVariantConst& arg_, JsonDocument& resp_ ) {
-	ESP_LOGI( Tag, "thingsboard: rpc: hello there!" );
+	ESP_LOGI( Tag, "thingsboard: refreshed shared attribs." );
 }
 
 // ====== Cli ======
