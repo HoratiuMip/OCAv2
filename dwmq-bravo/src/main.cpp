@@ -203,7 +203,7 @@ _RGH_PROTECTED:
 		system_state_t sys_state;
 
 		sys_state.ctl.power  = gpio_get_level( GPIO_NUM_PWR_OPTO ) == RESET;
-		sys_state.ctl.blue   = gpio_get_level( GPIO_NUM_PWR_RL )   == RESET;
+		sys_state.ctl.blue   = gpio_get_level( GPIO_NUM_BLUE_RL )  == RESET;
 		sys_state.ctl.fans   = gpio_get_level( GPIO_NUM_FANS_RL )  == RESET;
 		sys_state.ctl.lights = gpio_get_level( GPIO_NUM_LSTR_RL )  == RESET;
 
@@ -250,12 +250,18 @@ public:
 		if( gpio_get_level( GPIO_NUM_PWR_OPTO ) == SET ) return;
 		this->_toggle_power();
 	}
+	RGH_inline void power_toggle( void ) {
+		this->_toggle_power();
+	}
 
 	RGH_inline void bluetooth_on( void ) {
 		this->_close_relay( GPIO_NUM_BLUE_RL );
 	}
 	RGH_inline void bluetooth_off( void ) {
 		this->_open_relay( GPIO_NUM_BLUE_RL );
+	}
+	RGH_inline void bluetooth_toggle( void ) {
+		if( gpio_get_level( GPIO_NUM_BLUE_RL ) == RESET ) this->bluetooth_off(); else this->bluetooth_on();
 	}
 
 	RGH_inline void fans_on( void ) {
@@ -264,12 +270,18 @@ public:
 	RGH_inline void fans_off( void ) {
 		this->_open_relay( GPIO_NUM_FANS_RL );
 	}
+	RGH_inline void fans_toggle( void ) {
+		if( gpio_get_level( GPIO_NUM_FANS_RL ) == RESET ) this->fans_off(); else this->fans_on();
+	}
 
 	RGH_inline void light_strip_on( void ) {
 		this->_close_relay( GPIO_NUM_LSTR_RL );
 	}
 	RGH_inline void light_strip_off( void ) {
 		this->_open_relay( GPIO_NUM_LSTR_RL );
+	}
+	RGH_inline void light_strip_toggle( void ) {
+		if( gpio_get_level( GPIO_NUM_LSTR_RL ) == RESET ) this->light_strip_off(); else this->light_strip_on();
 	}
 
 } Systemctl;
@@ -373,21 +385,27 @@ _RGH_PROTECTED:
 		_thingsboard_t( auto& hyper_ ) : _submodule_t( hyper_ ), _dev{ _hyper._MqttClient, 1024, 8192, _APIs } {}
 
 	_RGH_PROTECTED:
-		static void _rpc_hello_there( const JsonVariantConst& arg_, JsonDocument& resp_ );
+		static void _rpc_toggle_power( const JsonVariantConst& arg_, JsonDocument& resp_ );
+		static void _rpc_toggle_blue( const JsonVariantConst& arg_, JsonDocument& resp_ );
+		static void _rpc_toggle_fans( const JsonVariantConst& arg_, JsonDocument& resp_ );
+		static void _rpc_toggle_lights( const JsonVariantConst& arg_, JsonDocument& resp_ );
 
 	_RGH_PROTECTED:
 		static void _attr_sh_update( const JsonObjectConst& arg_ );
 
 	_RGH_PROTECTED:
-		Server_Side_RPC< 3, 5 >                        _rpc             = {};
+		Server_Side_RPC< 5, 5 >                        _rpc             = {};
 		Attribute_Request< 3, ATTR_UPPER_LIM >         _attr_request    = {};
 		Shared_Attribute_Update< 3, ATTR_UPPER_LIM >   _shared_update   = {};
 
 		const std::array< IAPI_Implementation*, 3 >    _APIs   = {
 			&_rpc, &_attr_request, &_shared_update
 		};
-		const std::array< RPC_Callback, 0 >            _RPC_Callbacks   = {
-
+		const std::array< RPC_Callback, 4 >            _RPC_Callbacks   = {
+			RPC_Callback{ ATTR_POWER, &_rpc_toggle_power },
+			RPC_Callback{ ATTR_BLUETOOTH, &_rpc_toggle_blue },
+			RPC_Callback{ ATTR_FANS, &_rpc_toggle_fans },
+			RPC_Callback{ ATTR_LIGHT_STRIP, &_rpc_toggle_lights }
 		};
 		const std::array< const char*, 5 >             _Attr_Shared     = {
 			ATTR_POWER,
@@ -453,6 +471,7 @@ _RGH_PROTECTED:
 
 		status_t _compound_stop( [[maybe_unused]]void* ) {
 			while( _tsk_main ) vTaskDelay( 100_pdms2t );
+			_rpc.RPC_Unsubscribe();
 			_dev.disconnect();
 			return RGH_OK;
 		}
@@ -464,18 +483,18 @@ _RGH_PROTECTED:
 
 	_RGH_PROTECTED:
 		static void _main( void* self_ ) {
-			auto* self           = ( _thingsboard_t* )self_;
-			auto  prev_sys_state = SysState.dering_far_or( 0xFFFFFFFF, 10000, {} ); 
-			auto  prev_telmtr    = 0x0;
+			auto*     self           = ( _thingsboard_t* )self_;
+			auto      prev_sys_state = SysState.dering_far_or( 0xFFFFFFFF, 10000, {} ); 
+			int64_t   prev_telmtr    = 0x0;
 
 		for(; self->compound_is_up();) {
 			vTaskDelay( 150_pdms2t );
 			if( auto sys_state = SysState.dering_far( 5000, 100 ) ) {
-				// const auto &ctl = sys_state->ctl, &pctl = prev_sys_state.ctl;
-				// if( ctl.power != pctl.power )   self->_dev.sendAttributeData( ATTR_POWER, ctl.power ); 
-				// if( ctl.blue != pctl.blue )     self->_dev.sendAttributeData( ATTR_BLUETOOTH, ctl.blue ); 
-				// if( ctl.fans != pctl.fans )     self->_dev.sendAttributeData( ATTR_FANS, ctl.fans ); 
-				// if( ctl.lights != pctl.lights ) self->_dev.sendAttributeData( ATTR_LIGHT_STRIP, ctl.lights );
+				const auto &ctl = sys_state->ctl, &pctl = prev_sys_state.ctl;
+				if( ctl.power != pctl.power )   self->_dev.sendAttributeData( ATTR_POWER, ctl.power ); 
+				if( ctl.blue != pctl.blue )     self->_dev.sendAttributeData( ATTR_BLUETOOTH, ctl.blue ); 
+				if( ctl.fans != pctl.fans )     self->_dev.sendAttributeData( ATTR_FANS, ctl.fans ); 
+				if( ctl.lights != pctl.lights ) self->_dev.sendAttributeData( ATTR_LIGHT_STRIP, ctl.lights );
 
 				if( auto t_telmtr = esp_timer_get_time(); sys_state->ctl.power && t_telmtr - prev_telmtr >= 60'000'000 ) {
 					prev_telmtr = t_telmtr;
@@ -553,38 +572,41 @@ extern "C" void app_main( void ) {
 void TB_on_WiFi::_thingsboard_t::_attr_sh_update( const JsonObjectConst& arg_ ) {
 	ESP_LOGI( Tag, "thingsboard: refreshing shared attribs..." );
 
-	uint8_t but_gauge = false;
-	float   lvl_gauge = -1;
-
 	for( auto itr : arg_ ) { switch( txt_hash( itr.key().c_str() ) ) {
 		case txt_hash( ATTR_GAUGE ): {
-		    lvl_gauge = ( int )itr.value().as< float >();
+		    float lvl_gauge = ( int )itr.value().as< float >();
+
+			if( lvl_gauge >= 33.0 ) { Systemctl.bluetooth_on();    vTaskDelay( 1000_pdms2t ); }
+			if( lvl_gauge >= 66.0 ) { Systemctl.fans_on();         vTaskDelay( 1000_pdms2t ); }
+			if( lvl_gauge >= 96.0 ) { Systemctl.power_on();        vTaskDelay( 1000_pdms2t ); }
+			else                    { Systemctl.power_off();       vTaskDelay( 1000_pdms2t ); }
+			if( lvl_gauge < 66.0 )  { Systemctl.fans_off();        vTaskDelay( 1000_pdms2t ); }
+			if( lvl_gauge < 33.0 )  { Systemctl.bluetooth_off();   vTaskDelay( 1000_pdms2t ); }
 		break; }
-		
-	#define _ATTR_ON_OFF( attr, func ) \
-		case txt_hash( attr ): { \
-			but_gauge = true; \
-			if( itr.value().as< uint16_t >() ) Systemctl.func##_on(); else Systemctl.func##_off(); \
-		break; }
-		_ATTR_ON_OFF( ATTR_POWER, power )
-		_ATTR_ON_OFF( ATTR_BLUETOOTH, bluetooth )
-		_ATTR_ON_OFF( ATTR_FANS, fans )
-		_ATTR_ON_OFF( ATTR_LIGHT_STRIP, light_strip )
-	#undef _ATTR_ON_OFF
 	} }
 
-	if( not but_gauge && lvl_gauge >= 0 && lvl_gauge <= 100 ) {
-		if( lvl_gauge >= 25.0 ) { Systemctl.bluetooth_on();    vTaskDelay( 1000_pdms2t ); }
-		if( lvl_gauge >= 50.0 ) { Systemctl.light_strip_on();  vTaskDelay( 1000_pdms2t ); }
-		if( lvl_gauge >= 75.0 ) { Systemctl.fans_on();         vTaskDelay( 1000_pdms2t ); }
-		if( lvl_gauge >= 95.0 ) { Systemctl.power_on();        vTaskDelay( 1000_pdms2t ); }
-		else                    { Systemctl.power_off();       vTaskDelay( 1000_pdms2t ); }
-		if( lvl_gauge < 75.0 )  { Systemctl.fans_off();        vTaskDelay( 1000_pdms2t ); }
-		if( lvl_gauge < 50.0 )  { Systemctl.light_strip_off(); vTaskDelay( 1000_pdms2t ); }
-		if( lvl_gauge < 25.0 )  { Systemctl.bluetooth_off();   vTaskDelay( 1000_pdms2t ); }
-	}
-
 	ESP_LOGI( Tag, "thingsboard: refreshed shared attribs." );
+}
+
+void TB_on_WiFi::_thingsboard_t::_rpc_toggle_power( const JsonVariantConst& arg_, JsonDocument& resp_ ) {
+	ESP_LOGI( Tag, "thingsboard: executing rpc: toggle power..." );
+	Systemctl.power_toggle();
+	ESP_LOGI( Tag, "thingsboard: executed rpc: toggle power..." );
+}
+void TB_on_WiFi::_thingsboard_t::_rpc_toggle_blue( const JsonVariantConst& arg_, JsonDocument& resp_ ) {
+	ESP_LOGI( Tag, "thingsboard: executing rpc: toggle bluetooth..." );
+	Systemctl.bluetooth_toggle();
+	ESP_LOGI( Tag, "thingsboard: executed rpc: toggle bluetooth..." );
+}
+void TB_on_WiFi::_thingsboard_t::_rpc_toggle_fans( const JsonVariantConst& arg_, JsonDocument& resp_ ) {
+	ESP_LOGI( Tag, "thingsboard: executing rpc: toggle fans..." );
+	Systemctl.fans_toggle();
+	ESP_LOGI( Tag, "thingsboard: executed rpc: toggle fans..." );
+}
+void TB_on_WiFi::_thingsboard_t::_rpc_toggle_lights( const JsonVariantConst& arg_, JsonDocument& resp_ ) {
+	ESP_LOGI( Tag, "thingsboard: executing rpc: toggle lights..." );
+	Systemctl.light_strip_toggle();
+	ESP_LOGI( Tag, "thingsboard: executed rpc: toggle lights..." );
 }
 
 // ====== Cli ======
