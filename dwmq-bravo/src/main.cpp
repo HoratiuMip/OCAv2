@@ -13,7 +13,7 @@
 
 #include <rgh/gep/text_utils.hpp>
 #include <rgh/gep/fastcli.hpp>
-#include <rgh/gep/divergent_ring.hpp>
+#include <rgh/gep/dispenser.hpp>
 
 #include <rgh/ucp/core.hpp>
 #include <rgh/ucp/compound.hpp>
@@ -43,8 +43,6 @@ constexpr int                 SERIAL_BAUD_RATE     = 115200;
 constexpr int                 SERIAL_FAST_MS       = 100;
 constexpr int                 SERIAL_IDLE_MS       = 3000;
 constexpr int                 SERIAL_ACT_TO_US     = 20000000;
-
-constexpr int                 SYSSTATE_KEEP_MS     = 10000;
 
 constexpr gpio_num_t          GPIO_NUM_PWR_OPTO    = GPIO_NUM_32;
 constexpr gpio_num_t          GPIO_NUM_PWR_RL      = GPIO_NUM_25;
@@ -153,12 +151,12 @@ struct system_state_t {
 	} mtr;
 };
 
-Divergent_ring_dynamic_STL< system_state_t >   SysState      = { SYSSTATE_KEEP_MS };
-Compound_cluster_FreeRTOS                      CmpdCluster   = {};
+Dispenser< system_state_t >   SysState      = { DispenserMode_DropInterval };
+Compound_cluster_FreeRTOS     CmpdCluster   = {};
 
-i2c_master_bus_handle_t                        I2C_Bus0      = NULL;
-esp32::io::I2C_m2s                             I2C_BMP280    = {};
-snsd::BMP280                                   HS_BMP280     = {};
+i2c_master_bus_handle_t       I2C_Bus0      = NULL;
+esp32::io::I2C_m2s            I2C_BMP280    = {};
+snsd::BMP280                  HS_BMP280     = {};
 
 class System_ctl {
 public:
@@ -211,7 +209,7 @@ _RGH_PROTECTED:
 		vTaskDelay( 20_pdms2t );
 		HS_BMP280.load_data( &sys_state.mtr.heatsink_temp, nullptr );
 
-		SysState.enring( std::move( sys_state ) );
+		SysState.control( std::move( sys_state ) ).commit();
 		
 		vTaskDelay( 1000_pdms2t );
 	} }
@@ -471,6 +469,7 @@ _RGH_PROTECTED:
 
 		status_t _compound_stop( [[maybe_unused]]void* ) {
 			while( _tsk_main ) vTaskDelay( 100_pdms2t );
+			_shared_update.Shared_Attributes_Unsubscribe();
 			_rpc.RPC_Unsubscribe();
 			_dev.disconnect();
 			return RGH_OK;
@@ -484,12 +483,12 @@ _RGH_PROTECTED:
 	_RGH_PROTECTED:
 		static void _main( void* self_ ) {
 			auto*     self           = ( _thingsboard_t* )self_;
-			auto      prev_sys_state = SysState.dering_far_or( 0xFFFFFFFF, 10000, {} ); 
+			auto      prev_sys_state = system_state_t{}; 
 			int64_t   prev_telmtr    = 0x0;
 
 		for(; self->compound_is_up();) {
 			vTaskDelay( 150_pdms2t );
-			if( auto sys_state = SysState.dering_far( 5000, 100 ) ) {
+			if( auto sys_state = SysState.watch( 5000ll, 100ll ) ) {
 				const auto &ctl = sys_state->ctl, &pctl = prev_sys_state.ctl;
 				if( ctl.power != pctl.power )   self->_dev.sendAttributeData( ATTR_POWER, ctl.power ); 
 				if( ctl.blue != pctl.blue )     self->_dev.sendAttributeData( ATTR_BLUETOOTH, ctl.blue ); 
@@ -576,12 +575,12 @@ void TB_on_WiFi::_thingsboard_t::_attr_sh_update( const JsonObjectConst& arg_ ) 
 		case txt_hash( ATTR_GAUGE ): {
 		    float lvl_gauge = ( int )itr.value().as< float >();
 
-			if( lvl_gauge >= 33.0 ) { Systemctl.bluetooth_on();    vTaskDelay( 1000_pdms2t ); }
-			if( lvl_gauge >= 66.0 ) { Systemctl.fans_on();         vTaskDelay( 1000_pdms2t ); }
-			if( lvl_gauge >= 96.0 ) { Systemctl.power_on();        vTaskDelay( 1000_pdms2t ); }
-			else                    { Systemctl.power_off();       vTaskDelay( 1000_pdms2t ); }
-			if( lvl_gauge < 66.0 )  { Systemctl.fans_off();        vTaskDelay( 1000_pdms2t ); }
-			if( lvl_gauge < 33.0 )  { Systemctl.bluetooth_off();   vTaskDelay( 1000_pdms2t ); }
+			if( lvl_gauge >= 33.0 ) { Systemctl.bluetooth_on();    vTaskDelay( 333_pdms2t ); }
+			if( lvl_gauge >= 66.0 ) { Systemctl.fans_on();         vTaskDelay( 333_pdms2t ); }
+			if( lvl_gauge >= 96.0 ) { Systemctl.power_on();        vTaskDelay( 333_pdms2t ); }
+			else                    { Systemctl.power_off();       vTaskDelay( 333_pdms2t ); }
+			if( lvl_gauge < 66.0 )  { Systemctl.fans_off();        vTaskDelay( 333_pdms2t ); }
+			if( lvl_gauge < 33.0 )  { Systemctl.bluetooth_off();   vTaskDelay( 333_pdms2t ); }
 		break; }
 	} }
 
@@ -591,22 +590,22 @@ void TB_on_WiFi::_thingsboard_t::_attr_sh_update( const JsonObjectConst& arg_ ) 
 void TB_on_WiFi::_thingsboard_t::_rpc_toggle_power( const JsonVariantConst& arg_, JsonDocument& resp_ ) {
 	ESP_LOGI( Tag, "thingsboard: executing rpc: toggle power..." );
 	Systemctl.power_toggle();
-	ESP_LOGI( Tag, "thingsboard: executed rpc: toggle power..." );
+	ESP_LOGI( Tag, "thingsboard: executed rpc: toggle power." );
 }
 void TB_on_WiFi::_thingsboard_t::_rpc_toggle_blue( const JsonVariantConst& arg_, JsonDocument& resp_ ) {
 	ESP_LOGI( Tag, "thingsboard: executing rpc: toggle bluetooth..." );
 	Systemctl.bluetooth_toggle();
-	ESP_LOGI( Tag, "thingsboard: executed rpc: toggle bluetooth..." );
+	ESP_LOGI( Tag, "thingsboard: executed rpc: toggle bluetooth." );
 }
 void TB_on_WiFi::_thingsboard_t::_rpc_toggle_fans( const JsonVariantConst& arg_, JsonDocument& resp_ ) {
 	ESP_LOGI( Tag, "thingsboard: executing rpc: toggle fans..." );
 	Systemctl.fans_toggle();
-	ESP_LOGI( Tag, "thingsboard: executed rpc: toggle fans..." );
+	ESP_LOGI( Tag, "thingsboard: executed rpc: toggle fans." );
 }
 void TB_on_WiFi::_thingsboard_t::_rpc_toggle_lights( const JsonVariantConst& arg_, JsonDocument& resp_ ) {
 	ESP_LOGI( Tag, "thingsboard: executing rpc: toggle lights..." );
 	Systemctl.light_strip_toggle();
-	ESP_LOGI( Tag, "thingsboard: executed rpc: toggle lights..." );
+	ESP_LOGI( Tag, "thingsboard: executed rpc: toggle lights." );
 }
 
 // ====== Cli ======
