@@ -14,6 +14,7 @@
 #include <rgh/gep/text_utils.hpp>
 #include <rgh/gep/fastcli.hpp>
 #include <rgh/gep/dispenser.hpp>
+#include <rgh/gep/dispenser_morphs.hpp>
 
 #include <rgh/ucp/core.hpp>
 #include <rgh/ucp/compound.hpp>
