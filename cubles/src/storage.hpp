@@ -1,6 +1,7 @@
 #pragma once
 
 #include "config.hpp"
+#include ".env"
 
 #include <nvs_flash.h>
 #include <Preferences.h>
@@ -50,11 +51,11 @@ public:
     inline status_t set_tb_token ( const string& tok_ )   { return this->_write< string >( STORAGE_TB_TOKEN,  tok_ ); }
 
 public:
-    inline auto get_wifi_ssid( void ) { this->_begin( STORAGE_SECTOR, true ); auto ret = this->Preferences::getString( STORAGE_WIFI_SSID, "" ); this->_end(); return ret; }
-    inline auto get_wifi_pwrd( void ) { this->_begin( STORAGE_SECTOR, true ); auto ret = this->Preferences::getString( STORAGE_WIFI_PWRD, "" ); this->_end(); return ret; }
-    inline auto get_tb_server( void ) { this->_begin( STORAGE_SECTOR, true ); auto ret = this->Preferences::getString( STORAGE_TB_SERVER, "" ); this->_end(); return ret; }
-    inline auto get_tb_port( void )   { this->_begin( STORAGE_SECTOR, true ); auto ret = this->Preferences::getInt   ( STORAGE_TB_PORT, 0x0 );  this->_end(); return ret; }
-    inline auto get_tb_token( void )  { this->_begin( STORAGE_SECTOR, true ); auto ret = this->Preferences::getString( STORAGE_TB_TOKEN, "" );  this->_end(); return ret; }
+    inline auto get_wifi_ssid( void ) { this->_begin( STORAGE_SECTOR, true ); auto ret = this->Preferences::getString( STORAGE_WIFI_SSID, _ENV_DEFAULT_WIFI_SSID ); this->_end(); return ret; }
+    inline auto get_wifi_pwrd( void ) { this->_begin( STORAGE_SECTOR, true ); auto ret = this->Preferences::getString( STORAGE_WIFI_PWRD, _ENV_DEFAULT_WIFI_PWRD ); this->_end(); return ret; }
+    inline auto get_tb_server( void ) { this->_begin( STORAGE_SECTOR, true ); auto ret = this->Preferences::getString( STORAGE_TB_SERVER, _ENV_DEFAULT_TB_SERVER ); this->_end(); return ret; }
+    inline auto get_tb_port( void )   { this->_begin( STORAGE_SECTOR, true ); auto ret = this->Preferences::getInt   ( STORAGE_TB_PORT,   _ENV_DEFAULT_TB_PORT );   this->_end(); return ret; }
+    inline auto get_tb_token( void )  { this->_begin( STORAGE_SECTOR, true ); auto ret = this->Preferences::getString( STORAGE_TB_TOKEN,  _ENV_DEFAULT_TB_TOKEN );  this->_end(); return ret; }
 
 };
 inline _Storage Storage;

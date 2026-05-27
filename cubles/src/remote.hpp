@@ -7,6 +7,7 @@
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#define MQTT_MAX_PACKET_SIZE 1024
 #include <Arduino_MQTT_Client.h>
 #include <Server_Side_RPC.h>
 #include <Attribute_Request.h>
@@ -16,6 +17,9 @@
 typedef void( *remote_sattr_cb_t )( const JsonObjectConst& );
 typedef function< void( void ) > remote_loop_cb_t;
 
+/**
+ * @brief Structure passed when calling Remote.init().
+ */
 struct remote_init_args_t {
     HVec< Daemon_cluster_FreeRTOS >   dmon_clst    = nullptr;
 	vector< RPC_Callback >            rpc_list     = {};
@@ -24,6 +28,9 @@ struct remote_init_args_t {
 	remote_loop_cb_t                  loop_cb      = nullptr;
 };
 
+/**
+ * @brief Remote master.
+ */
 class _Remote {
 protected:
     struct _subdaemon_t { _subdaemon_t( _Remote& hyper_ ) : _hyper{ hyper_ } {} _Remote& _hyper; };
@@ -133,16 +140,17 @@ protected:
 		_thingsboard_t( auto& hyper_ ) : _subdaemon_t( hyper_ ), _dev{ _hyper._mqtt_client, 1024, 8192, _APIs } {}
 
 	protected:
-		ThingsBoardSized< 48 >                                          _dev             ;
 		TaskHandle_t                                                    _tsk_main        = nullptr;
 
-		Server_Side_RPC< 1, 5 >                                         _rpc             = {};
-		Attribute_Request< 1, REMOTE_TB_MAX_SHARED_ATTRIBUTES >         _sattr_request   = {};
-		Shared_Attribute_Update< 1, REMOTE_TB_MAX_SHARED_ATTRIBUTES >   _sattr_update    = {};
+		Server_Side_RPC< 3, 5 >                                         _rpc             = {};
+		Attribute_Request< 3, REMOTE_TB_MAX_SHARED_ATTRIBUTES >         _sattr_request   = {};
+		Shared_Attribute_Update< 3, REMOTE_TB_MAX_SHARED_ATTRIBUTES >   _sattr_update    = {};
 
 		const std::array< IAPI_Implementation*, 3 >                     _APIs            = {
 			&_rpc, &_sattr_request, &_sattr_update
 		};
+
+		ThingsBoardSized< 16 >                                          _dev;
 		
 	protected:
 		status_t _daemon_start( [[maybe_unused]]void* ) override {
@@ -156,23 +164,25 @@ protected:
 							    ( ( port != 0x0 ) << 1 ) |
 							    ( not token.isEmpty() );
 			ASSERT_OR( cred_bits == 0b111 ) { 
-				ESP_LOGE( TAG, "remote: tb: credentials invalid: %d.", cred_bits );
+				ESP_LOGE( TAG, "remote: tb: credentials missing: %d.", cred_bits );
 				return ERR_NOT_FOUND;
 			}
 			
 			ASSERT_OR( _dev.connect( server.c_str(), token.c_str(), port ) ) {
 				ESP_LOGE( TAG, "remote: tb: bad connection." );
 				return ERR_EXCOMCALL;
-			}
-
+			} 
+			
 			if( not _hyper._rpc_list.empty() ) {
 				ASSERT_OR( _rpc.RPC_Subscribe( _hyper._rpc_list.cbegin(), _hyper._rpc_list.cend() ) ) {
 					ESP_LOGE( TAG, "remote: tb: bad rpc subscribe." );
 					return ERR_EXCOMCALL;
+				} else {
+					ESP_LOGI( TAG, "remote: tb: subscribed %d rpc(s).", (int)_hyper._rpc_list.size() );
 				}
 			}
 			
-			if( not _hyper._sattr_list.empty() ) {
+			if( not _hyper._sattr_list.empty() and _hyper._sattr_cb ) {
 				ASSERT_OR( _sattr_update.Shared_Attributes_Subscribe(
 					Shared_Attribute_Callback< REMOTE_TB_MAX_SHARED_ATTRIBUTES >{ _hyper._sattr_cb, _hyper._sattr_list.cbegin(), _hyper._sattr_list.cend() }
 				) ) {
@@ -190,7 +200,7 @@ protected:
 
 			ASSERT_OR( pdPASS == xTaskCreate(
 				&_thingsboard_t::_main, std::format( "{}/remote-tb/main", TAG ).c_str(),
-				8192, this, TaskPriority_Default, &_tsk_main
+				8192, this, 10, &_tsk_main
 			) ) {
 				ESP_LOGE( TAG, "remote: tb: bad main task create." );
 				return ERR_SYSCALL;
@@ -234,6 +244,10 @@ public:
 	inline bool send_attr( const char* key_, const auto& val_ ) {
 		return _Thingsboard._dev.sendAttributeData( key_, val_ );
 	} 
+
+	inline bool send_tlmtr( const char* key_, const auto& val_ ) {
+		return _Thingsboard._dev.sendTelemetryData( key_, val_ );
+	}
 
 	inline auto wifi_rssi( void ) { return WiFi.RSSI(); }
 

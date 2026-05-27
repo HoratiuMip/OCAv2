@@ -10,36 +10,69 @@
 #include <rgh/gep/text_utils.hpp>
 #include <rgh/gep/fastcli.hpp>
 
+/* =-. Modules .-= */
+#include "environment.hpp"
 #include "hidropump.hpp"
+#include "master.hpp"
 #include "remote.hpp"
 #include "storage.hpp"
 
-Daemon_cluster_FreeRTOS   Daemon_Cluster;
+Daemon_cluster_FreeRTOS   Daemon_Cluster   = {};
+atomic_bool               RPC_Recv         = false;
 
 void init_static( void ) {
-    Hidro_Pump.init();
+	ASSERT_OR( OK == Master.init() ) critical_handler();
+    ASSERT_OR( OK == Hidro_Pump.init() ) critical_handler();
+	ASSERT_OR( OK == Environment.init() ) critical_handler();
 
-    Daemon_Cluster.when_critical( [] ( [[maybe_unused]]auto ) -> void { critical_handler(); } );
+    ASSERT_OR( OK == Remote.init( remote_init_args_t{
+        .dmon_clst = Daemon_Cluster,
+		.rpc_list  = {
+			RPC_Callback{ REMOTE_RPC_HIDROPUMP_ON, [] ( const JsonVariantConst& args_, JsonDocument& resp_ ) static -> void {
+				ASSERT_OR( args_.is< float >() ) return;
+				const auto period_mins = args_.as< float >();
+
+				const auto period_ms = ( uint32_t )( period_mins * 60'000 );
+				ESP_LOGI( TAG, "main: rpc: %s: period-ms: %u", REMOTE_RPC_HIDROPUMP_ON, period_ms );
+				Hidro_Pump.engage( period_mins * 60'000 );
+
+				RPC_Recv.store( true, std::memory_order_release );
+			} }
+		},
+		.loop_cb   = [
+			prev_class_I_sc  = esp_timer_get_time(),
+			prev_class_II_sc = esp_timer_get_time()
+		] ( void ) mutable -> void {
+			int64_t now_sc = esp_timer_get_time();
+
+			if( RPC_Recv.load( std::memory_order_relaxed ) ) {
+				prev_class_I_sc = prev_class_II_sc = 0;
+				RPC_Recv.store( false, std::memory_order_release );
+			}
+
+			ASSERT_AND( now_sc - prev_class_II_sc >= REMOTE_CLASS_II_INTERVAL_MS*1000 ) {
+				prev_class_II_sc = now_sc;
+
+				Remote.send_attr( REMOTE_ATTR_KEY_HP_FEED, Hidro_Pump.is_engaged_feedback() );
+				Remote.send_attr( REMOTE_ATTR_KEY_HP_REMAINING, Hidro_Pump.remaining_minutes() );
+			}
+		
+			ASSERT_AND( now_sc - prev_class_I_sc >= REMOTE_CLASS_I_INTERVAL_MS*1000 ) {
+				prev_class_I_sc = now_sc;
+
+				Remote.send_attr( REMOTE_ATTR_KEY_WIFI_RSSI, Remote.wifi_rssi() );
+				
+				Remote.send_tlmtr( REMOTE_TLMTR_KEY_TEMP_ALPHA, Environment.temp_alpha.load() );
+			}
+		} 
+    } ) ) critical_handler();
+
+	Daemon_Cluster.when_critical( [] ( [[maybe_unused]]auto ) -> void { critical_handler(); } );
 	Daemon_Cluster.init( {
 		.iterate_interval_ms = DAEMON_CLUSTER_ITERATE_INTERVAL_MS,
 		.task_stack_depth    = CONFIG_ESP_MAIN_TASK_STACK_SIZE,
 		.task_priority       = TaskPriority_High
 	} );
-
-    Remote.init( remote_init_args_t{
-        .dmon_clst = Daemon_Cluster,
-		.loop_cb   = [
-			prev_class_I_sc = esp_timer_get_time()
-		] ( void ) mutable -> void {
-			int64_t now_sc = esp_timer_get_time();
-		
-			ASSERT_AND( now_sc - prev_class_I_sc >= REMOTE_CLASS_I_INTERVAL_MS*1000 ) {
-				prev_class_I_sc = now_sc;
-
-				Remote.send_attr( "wifi-rssi", Remote.wifi_rssi() );
-			}
-		} 
-    } );
 }
 
 void query_serial_for_cli( void );
