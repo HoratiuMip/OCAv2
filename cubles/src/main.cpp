@@ -18,7 +18,7 @@
 #include "storage.hpp"
 
 Daemon_cluster_FreeRTOS   Daemon_Cluster   = {};
-atomic_bool               RPC_Recv         = false;
+atomic_bool               RPC_Recv         = { false };
 
 void init_static( void ) {
 	ASSERT_OR( OK == Master.init() ) critical_handler();
@@ -40,8 +40,8 @@ void init_static( void ) {
 			} }
 		},
 		.loop_cb   = [
-			prev_class_I_sc  = esp_timer_get_time(),
-			prev_class_II_sc = esp_timer_get_time()
+			prev_class_I_sc  = (int64_t)0,
+			prev_class_II_sc = (int64_t)0
 		] ( void ) mutable -> void {
 			int64_t now_sc = esp_timer_get_time();
 
@@ -50,14 +50,14 @@ void init_static( void ) {
 				RPC_Recv.store( false, std::memory_order_release );
 			}
 
-			ASSERT_AND( now_sc - prev_class_II_sc >= REMOTE_CLASS_II_INTERVAL_MS*1000 ) {
+			ASSERT_AND( now_sc - prev_class_II_sc >= REMOTE_CLASS_II_INTERVAL_MS*1'000 ) {
 				prev_class_II_sc = now_sc;
 
 				Remote.send_attr( REMOTE_ATTR_KEY_HP_FEED, Hidro_Pump.is_engaged_feedback() );
 				Remote.send_attr( REMOTE_ATTR_KEY_HP_REMAINING, Hidro_Pump.remaining_minutes() );
 			}
 		
-			ASSERT_AND( now_sc - prev_class_I_sc >= REMOTE_CLASS_I_INTERVAL_MS*1000 ) {
+			ASSERT_AND( now_sc - prev_class_I_sc >= REMOTE_CLASS_I_INTERVAL_MS*1'000 ) {
 				prev_class_I_sc = now_sc;
 
 				Remote.send_attr( REMOTE_ATTR_KEY_WIFI_RSSI, Remote.wifi_rssi() );
