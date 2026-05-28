@@ -34,7 +34,7 @@ void init_static( void ) {
 
 				const auto period_ms = ( uint32_t )( period_mins * 60'000 );
 				ESP_LOGI( TAG, "main: rpc: %s: period-ms: %u", REMOTE_RPC_HIDROPUMP_ON, period_ms );
-				Hidro_Pump.engage( period_mins * 60'000 );
+				Hidro_Pump.engage( period_ms );
 
 				RPC_Recv.store( true, std::memory_order_release );
 			} }
@@ -53,8 +53,9 @@ void init_static( void ) {
 			ASSERT_AND( now_sc - prev_class_II_sc >= REMOTE_CLASS_II_INTERVAL_MS*1'000 ) {
 				prev_class_II_sc = now_sc;
 
-				Remote.send_attr( REMOTE_ATTR_KEY_HP_FEED, Hidro_Pump.is_engaged_feedback() );
 				Remote.send_attr( REMOTE_ATTR_KEY_HP_REMAINING, Hidro_Pump.remaining_minutes() );
+
+				Remote.send_tlmtr( REMOTE_TLMTR_KEY_HP_FEED, Hidro_Pump.is_engaged_feedback() );
 			}
 		
 			ASSERT_AND( now_sc - prev_class_I_sc >= REMOTE_CLASS_I_INTERVAL_MS*1'000 ) {
@@ -111,6 +112,8 @@ Fast_cli Cli = {
 		.opts = {
 			{ .sh0rt = 'r', .l0ng = "restart", .arg = Fast_cli::Arg_text },
 
+			{ .sh0rt = 'R', .l0ng = "report" },
+
             { .sh0rt = 'h', .l0ng = "hidropump-off" },
             { .sh0rt = 'H', .l0ng = "hidropump-on", .arg = Fast_cli::Arg_i32 }
 		},
@@ -122,6 +125,16 @@ Fast_cli Cli = {
 							case txt_hash( "system" ): esp_restart();
 							case txt_hash( "storage" ): Storage.erase(); break;
 						}
+					break; }
+
+					case 'R': {
+						ESP_LOGI( TAG, "cli: systemctl: report: ..." );
+
+						Serial.println( std::format( 
+							"hidro-pump > remaining: {} | feedback: {}", 
+							Hidro_Pump.remaining_minutes(),
+							Hidro_Pump.is_engaged_feedback()
+						).c_str() );
 					break; }
 
                     case 'h': Hidro_Pump.disengage(); break;

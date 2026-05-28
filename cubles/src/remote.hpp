@@ -140,17 +140,17 @@ protected:
 		_thingsboard_t( auto& hyper_ ) : _subdaemon_t( hyper_ ), _dev{ _hyper._mqtt_client, 1024, 8192, _APIs } {}
 
 	protected:
-		TaskHandle_t                                                    _tsk_main        = nullptr;
+		TaskHandle_t                                                     _tsk_main        = nullptr;
 
-		Server_Side_RPC< 3, 5 >                                         _rpc             = {};
-		Attribute_Request< 3, REMOTE_TB_MAX_SHARED_ATTRIBUTES >         _sattr_request   = {};
-		Shared_Attribute_Update< 3, REMOTE_TB_MAX_SHARED_ATTRIBUTES >   _sattr_update    = {};
+		Server_Side_RPC< 12, 16 >                                         _rpc             = {};
+		Attribute_Request< 12, REMOTE_TB_MAX_SHARED_ATTRIBUTES >         _sattr_request   = {};
+		Shared_Attribute_Update< 12, REMOTE_TB_MAX_SHARED_ATTRIBUTES >   _sattr_update    = {};
 
-		const std::array< IAPI_Implementation*, 3 >                     _APIs            = {
+		const std::array< IAPI_Implementation*, 3 >                      _APIs            = {
 			&_rpc, &_sattr_request, &_sattr_update
 		};
 
-		ThingsBoardSized< 16 >                                          _dev;
+		ThingsBoardSized< 48 >                                           _dev;
 		
 	protected:
 		status_t _daemon_start( [[maybe_unused]]void* ) override {

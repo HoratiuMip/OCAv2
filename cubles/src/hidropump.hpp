@@ -75,7 +75,12 @@ public:
 
         if( period_ms_ == 0 ) { this->disengage(); return OK; }
 
-        ASSERT_OR( pdPASS == xTimerChangePeriod( _master_timer, pdMS_TO_TICKS( period_ms_ ), 0 ) ) return ERR_SYSCALL;
+        const TickType_t period_ticks = ((uint64_t)period_ms_ * CONFIG_FREERTOS_HZ) / 1'000;
+
+        const bool was_active = xTimerIsTimerActive( _master_timer );
+        ASSERT_OR( pdPASS == xTimerChangePeriod( _master_timer, period_ticks, 0 ) ) return ERR_SYSCALL;
+        if( was_active ) return OK;
+
         ASSERT_OR( pdPASS == xTimerStart( _master_timer, 0 ) ) return ERR_SYSCALL;
 
         gpio_set_level( GPIO_Q_D1_1, LOW );

@@ -46,14 +46,14 @@ constexpr uint32_t   REMOTE_WIFI_CONNECT_TRIES      = 5;
 constexpr uint32_t   REMOTE_WIFI_CONNECT_DELAY_MS   = 1000;
 
 constexpr uint32_t   REMOTE_TB_MAIN_TASK_DELAY_MS      = 150;
-constexpr uint32_t   REMOTE_TB_MAX_SHARED_ATTRIBUTES   = 10;
+constexpr uint32_t   REMOTE_TB_MAX_SHARED_ATTRIBUTES   = 16;
 constexpr uint32_t   REMOTE_TB_SATTR_REQ_TIMEOUT_MS    = 15'000;
 
 constexpr const char* const   REMOTE_RPC_HIDROPUMP_ON   = "hidropump-on"; 
 
-constexpr const char* const   REMOTE_ATTR_KEY_HP_FEED        = "hp-feed";
 constexpr const char* const   REMOTE_ATTR_KEY_HP_REMAINING   = "hp-rem";
 constexpr const char* const   REMOTE_ATTR_KEY_WIFI_RSSI      = "wifi-rssi";
+constexpr const char* const   REMOTE_TLMTR_KEY_HP_FEED       = "hp-feed";
 constexpr const char* const   REMOTE_TLMTR_KEY_TEMP_ALPHA    = "temp-alpha";
 
 /* =-. Storage .-= */
