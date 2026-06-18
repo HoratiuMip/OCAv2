@@ -44,19 +44,20 @@ public:
 		_sattr_list = move( args_.sattr_list );
 		_sattr_cb   = move( args_.sattr_cb );
 
+		_Thingsboard.daemon_set_deps( { _WiFi } );
+
 		_dmon_clst->push( { 
-			.ref        = _WiFi, 
-			.keep_alive = true,
-			.restart_if = [ this ] ( [[maybe_unused]]auto&, auto& args_ ) -> status_t { 
+			.ref       = _WiFi, 
+			.state_ctl = Daemon_cluster::StateCtl_KeepAlive,
+			.rst_if    = [ this ] ( auto& args_ ) -> status_t { 
 				ASSERT_OR( _WiFi.connected() ) { ESP_LOGW( TAG, "remote: restarting WiFi." ); return ERR_OPEN; }
 				return OK;
 			}
 		} );
 		_dmon_clst->push( { 
-			.ref        = _Thingsboard, 
-			.deps       = { _WiFi },
-			.keep_alive = true,
-			.restart_if = [ this ] ( [[maybe_unused]]auto&, auto& args_ ) -> status_t { 
+			.ref       = _Thingsboard, 
+			.state_ctl = Daemon_cluster::StateCtl_KeepAlive,
+			.rst_if    = [ this ] ( auto& args_ ) -> status_t { 
 				ASSERT_OR( _Thingsboard.connected() ) {
 					ESP_LOGW( TAG, "remote: restarting Thingsboard." );
 					return ERR_OPEN;
@@ -82,7 +83,10 @@ protected:
 protected:
 	struct _wifi_t : public _subdaemon_t, public Daemon { friend class _Remote;
 	public:
-		virtual std::string_view daemon_name( void ) const { return "WiFi"; }
+		virtual string_view daemon_name( void ) const override { return "WiFi"; }
+		virtual string daemon_report( void ) const override {
+			return format( "--- WiFi ---\n - connected: {}\n", this->connected() ? "yes" : "no" );
+		}
 
     public:
 	    _wifi_t( auto& hyper_ ) : _subdaemon_t( hyper_ ) {}
@@ -128,13 +132,16 @@ protected:
 		}
 
 	public:
-		inline bool connected( void ) { return WiFi.status() == WL_CONNECTED; }
+		inline bool connected( void ) const { return WiFi.status() == WL_CONNECTED; }
 
 	} _WiFi{ *this };
 
 	struct _thingsboard_t : public _subdaemon_t, public Daemon { friend class _Remote;
 	public:
 		virtual std::string_view daemon_name( void ) const { return "Thingsboard"; }
+		virtual string daemon_report( void ) const override {
+			return format( "--- Thingsboard ---\n - connected: {}\n", this->connected() ? "yes" : "no" );
+		}
 
 	public:
 		_thingsboard_t( auto& hyper_ ) : _subdaemon_t( hyper_ ), _dev{ _hyper._mqtt_client, 1024, 8192, _APIs } {}
@@ -142,7 +149,7 @@ protected:
 	protected:
 		TaskHandle_t                                                     _tsk_main        = nullptr;
 
-		Server_Side_RPC< 12, 16 >                                         _rpc             = {};
+		Server_Side_RPC< 12, 16 >                                        _rpc             = {};
 		Attribute_Request< 12, REMOTE_TB_MAX_SHARED_ATTRIBUTES >         _sattr_request   = {};
 		Shared_Attribute_Update< 12, REMOTE_TB_MAX_SHARED_ATTRIBUTES >   _sattr_update    = {};
 
@@ -224,7 +231,7 @@ protected:
 		static void _main( void* arg_ ) {
 			auto*  self = ( _thingsboard_t* )arg_;
 
-		for(; self->daemon_is_up();) {
+		for(; self->daemon_is_positive();) {
 			vTaskDelay( pdMS_TO_TICKS( REMOTE_TB_MAIN_TASK_DELAY_MS ) );
 
 			ASSERT_AND( self->connected() ) {
@@ -236,7 +243,7 @@ protected:
 		}
 
 	public:
-		inline bool connected( void ) { return _dev.connected(); }
+		inline bool connected( void ) const { return const_cast< decltype( _dev )& >( _dev ).connected(); }
 		
 	} _Thingsboard{ *this };
 

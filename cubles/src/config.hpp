@@ -32,7 +32,7 @@ constexpr gpio_num_t   GPIO_Q_D1_1   = GPIO_NUM_19; // -> K1.1
 constexpr gpio_num_t   GPIO_Q_D1_2   = GPIO_NUM_18; // -> K1.2
 
 /* =-. Hidropump .-= */
-constexpr uint32_t   HIDROPUMP_MAX_ENGAGE_PERIOD_MS   = 120 * 60'000; // 2 hours
+constexpr uint32_t   HIDROPUMP_MAX_ENGAGE_PERIOD_MS   = 60 * 60'000; // 1 hour
 constexpr uint32_t   HIDROPUMP_RELAY_HOP_GAP_MS       = 500;
 
 /* =-. Daemons .-= */
