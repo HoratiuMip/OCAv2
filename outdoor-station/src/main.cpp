@@ -9,12 +9,13 @@
 
 /* =-. RGH .-= */
 #include <rgh/ucp/ino/wifi_daemon.hpp> 
-#define RGH_INO_THINGSBOARD_DAEMON_CFG_ thingsboard_daemon_static_default_cfg_t
+#define RGH_INO_THINGSBOARD_DAEMON_MQTT_MAX_PACKET_SIZE_ 1024
+#define RGH_INO_THINGSBOARD_DAEMON_CFG_                  thingsboard_daemon_static_default_cfg_t
 #include <rgh/ucp/ino/thingsboard_daemon.hpp>
 
+#include <rgh/ucp/esp32-5x/nvs_flash.hpp>
 #include <rgh/ucp/esp32-5x/HRPT_array.hpp>
-#include <rgh/ucp/esp32-5x/uP_temp.hpp>
-#include <rgh/ucp/esp32-5x/sns-drv/bmp280.hpp>
+#include <rgh/ucp/esp32-5x/sns-drv/bmx280.hpp>
 
 #include <rgh/gep/rtatomic.hpp>
 #include <rgh/gep/text_utils.hpp>
@@ -25,6 +26,8 @@ using namespace rgh::freertos; using namespace rgh::freertos_literals;
 /* =-. Others .-= */
 #include ".env"
 using namespace std; using namespace std::chrono_literals;
+
+void query_serial_for_cli( void );
 
 /* =-. Error handler .-= */
 static uint32_t Error_word = 0x0;
@@ -54,30 +57,29 @@ public:
 	/**
 	 * @brief BME280 - temperature, pressure and humidity ALPHA.
 	 */
-	static constexpr i2c_device_config_t   BMP280_ALPHA_I2C_CONFIG   = {
+	static constexpr i2c_device_config_t   BME280_ALPHA_I2C_CONFIG   = {
 		.dev_addr_length = I2C_ADDR_BIT_LEN_7,
-		.device_address  = BMP280::I2C_ADDRESS_SDO_VCC,
+		.device_address  = BME280::I2C_ADDRESS_SDO_VCC,
 		.scl_speed_hz    = 100000,
 	};
-	BMP280                                 BMP280_alpha              = {};
+	BME280                                 BME280_alpha              = {};
 
 public:
-	rt_atomic< float >   A_temp    = { rt_atomic< float >::modch_absdiff< 1.0f > };
-	rt_atomic< float >   uP_temp   = { rt_atomic< float >::modch_absdiff< 1.0f > };
+	rt_atomic< float >   out_tmp   = { rt_atomic< float >::modch_absdiff< 0.5f > };
+	rt_atomic< float >   out_prs   = { rt_atomic< float >::modch_absdiff< 0.3f > };
+	rt_atomic< float >   out_hum   = { rt_atomic< float >::modch_absdiff< 3.0f > };
 
 	status_t init( void ) {
-		uP_temp_sensor_init( { RGH_ESP32_UP_TEMP_SNS_RANGE_n10_80 } );
-
 		ASSERT_OR( ESP_OK == i2c_new_master_bus( &I2C_BUS_ALPHA_CONFIG, &I2C_bus_alpha ) ) return ERR_PLATFORMCALL;
 
-		ASSERT_STATUS_AND( BMP280_alpha.bind( I2C_bus_alpha, BMP280_ALPHA_I2C_CONFIG, 300 ) ) {
-            for( uint8_t n = 1; n <= 3; ++n ) ASSERT_STATUS_AND( BMP280_alpha.load_calibs() ) break;
+		ASSERT_STATUS_AND( BME280_alpha.bind( I2C_bus_alpha, BME280_ALPHA_I2C_CONFIG, 300 ) ) {
+            for( uint8_t n = 1; n <= 3; ++n ) ASSERT_STATUS_AND( BME280_alpha.load_calibs() ) break;
         }
 
 		ASSERT_STATUS_OR_RET( _tsk_main.launch( "input", 1024, 4, [ this ] ( auto* ) -> void {
-			auto data = BMP280_alpha.oneshot_1xf(); 
-			ASSERT_AND( data.has_value() ) {
-				A_temp.push( get<0>( data.value() ) );
+			auto bme_data = BME280_alpha.oneshot_1xf(); 
+			ASSERT_AND( bme_data.has_value() ) {
+				out_tmp.push( get<0>( bme_data.value() ) );
 			}
 
 			vTaskDelay( 1000_pdms2t );
@@ -95,28 +97,26 @@ protected:
 Daemon_cluster_FreeRTOS   Daemon_Cluster   = {};
 
 RGH_INO_WIFI_DAEMON_QUICK_DRIDGE( WiFi_Dridge,
-([] ( void ) static -> wifi_daemon_start_args_t { return {
-	.ssid    = ENV_DEFAULT_WIFI_SSID,
-	.pwrd    = ENV_DEFAULT_WIFI_PWRD,
+([] ( void ) static -> auto { return (void)unique_lock{ EEPROM }, wifi_daemon_start_args_t{
+	.ssid    = EEPROM.getString( "wifi-ssid", ENV_DEFAULT_WIFI_SSID ),
+	.pwrd    = EEPROM.getString( "wifi-pwrd", ENV_DEFAULT_WIFI_PWRD ),
 	.vrf_ms  = 1'000,
 	.vrf_cnt = 5
 }; }) )
 RGH_INO_THINGSBOARD_DAEMON_QUICK_DRIDGE( Thingsboard_Dridge,
-([] ( void ) static -> thingsboard_daemon_start_args_t { return {
+([] ( void ) static -> auto { return (void)unique_lock{ EEPROM }, thingsboard_daemon_start_args_t{
 	.server  = ENV_DEFAULT_TB_SERVER,
 	.token   = ENV_DEAFULT_TB_TOKEN,
 	.port    = ENV_DEFAULT_TB_PORT,
 	.loop_cb = [
 		TIMS    = HRPT_array< 2 >{ { 30s, 60s } },
 		
-		A_temp  = Input.A_temp.get_hook(),
-		uP_temp = Input.uP_temp.get_hook()
+		out_tmp = Input.out_tmp.get_hook()
 	] ( void ) mutable -> void {
 		TIMS.disarm();
 		
-		RGH_ESP32_IF_HRPT_OUT_OR_RTA_MOD( Input.A_temp, &A_temp, TIMS, 0 ) Thingsboard_Daemon.send_tlmtr( "a-temp", rtav );
+		RGH_ESP32_IF_HRPT_OUT_OR_RTA_MOD( Input.out_tmp, &out_tmp, TIMS, 0 ) Thingsboard_Daemon.send_tlmtr( "o-tmp", rtav );
 
-		RGH_ESP32_IF_HRPT_OUT_OR_RTA_MOD( Input.uP_temp, &uP_temp, TIMS, 1 ) Thingsboard_Daemon.send_tlmtr( "up-temp", rtav );
 		if( TIMS(1) ) Thingsboard_Daemon.send_attr( "wifi-rssi", WiFi_Daemon.rssi() );
 		
 		TIMS.arm();
@@ -156,8 +156,6 @@ void init_static( void ) {
 	} ) ) critical_handler();
 }
 
-void query_serial_for_cli( void );
-
 extern "C" void app_main( void ) {
 	Serial.begin( 115200 );
 	vTaskDelay( 1000_pdms2t );
@@ -193,7 +191,6 @@ Fast_cli Cli = {
 
 					case 'R': {
 						Serial.print( "OCA//Outdoor-Station//Alpha\n" );
-						Serial.printf( "uP temperature: %.2f\n", uP_temp_read().value_or( numeric_limits< float >::quiet_NaN() ) );
 						Serial.print( Daemon_Cluster.report( nullptr ).c_str() );
 					break; }
 				}
